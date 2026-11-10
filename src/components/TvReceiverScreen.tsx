@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Tv, Minimize2, Wifi, WifiOff, Volume2, Pencil, Check, X } from 'lucide-react';
 import type { ServerMessage } from '../shared/protocol';
 import { SignalingClient } from '../utils/signalingClient';
-import { createTvStatsSampler } from '../utils/rtcStats';
+import { browserLabel, createTvStatsSampler } from '../utils/rtcStats';
+import { createDecodeWatchdog } from '../utils/decodeWatchdog';
 import { addOrQueueIceCandidate, flushQueuedIceCandidates, tuneReceiverForLowLatency } from '../utils/peer';
 
 const TV_ID_KEY = 'uvlink.tvId';
@@ -183,13 +184,40 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
         return;
       }
 
-      const sample = createTvStatsSampler();
+      const sample = createTvStatsSampler(browserLabel(navigator.userAgent));
+      // Frames arriving but none decoded = this TV can't decode the codec (common with broken
+      // hardware H.264 decoders on Android TVs). Tell the PC once; it reconnects with another codec.
+      const decodeStalled = createDecodeWatchdog();
+      // Testing aid: /?mode=tv&debugStall=H264 pretends H.264 can't be decoded here.
+      const debugStall = new URLSearchParams(window.location.search).get('debugStall')?.toUpperCase() ?? null;
+      const startedAt = Date.now();
+      let stallReported = false;
       session.statsTimer = window.setInterval(async () => {
         if (sessionRef.current !== session) return;
         try {
-          const stats = sample(await pc.getStats());
+          const report = await pc.getStats();
+          const stats = sample(report);
           setLiveInfo({ fps: stats.fps, width: stats.width, height: stats.height });
           client.send({ type: 'tv:stats', to: senderId, stats });
+
+          let bytesReceived: number | null = null;
+          report.forEach((s) => {
+            if (s.type === 'inbound-rtp' && s.kind === 'video' && typeof s.bytesReceived === 'number') {
+              bytesReceived = s.bytesReceived;
+            }
+          });
+          const stalled = decodeStalled({
+            timestampMs: Date.now(),
+            framesReceived: stats.framesReceived,
+            framesDecoded: stats.framesDecoded,
+            bytesReceived
+          });
+          const simulated = debugStall !== null && stats.codec?.toUpperCase() === debugStall && Date.now() - startedAt > 3000;
+          if (!stallReported && (stalled || simulated)) {
+            stallReported = true;
+            setNotice(`This TV couldn't decode ${stats.codec ?? 'the video'}. Switching to another format…`);
+            client.send({ type: 'tv:decode-stalled', to: senderId, codec: stats.codec, stats });
+          }
         } catch {
           // The connection closed between ticks; teardown clears this timer.
         }
@@ -243,6 +271,16 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
     if (phase === 'playing') pokeHud();
     else setHudVisible(true);
   }, [phase, pokeHud]);
+
+  // The Android TV app can show an iPhone (AirPlay) next to the cast; tell it when a cast is on screen.
+  useEffect(() => {
+    const bridge = (window as unknown as { UvLinkTV?: { castState?: (state: string) => void } }).UvLinkTV;
+    try {
+      bridge?.castState?.(phase);
+    } catch {
+      // Older TV app without the bridge.
+    }
+  }, [phase]);
 
   useEffect(
     () => () => {
@@ -427,6 +465,15 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
               <strong className="text-white">{name}</strong> and press{' '}
               <strong className="text-white">Cast Screen to TV</strong>.
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Status while playing, e.g. "switching to another format" */}
+      {phase === 'playing' && notice && (
+        <div className="absolute inset-x-0 top-16 flex justify-center pointer-events-none">
+          <div className="px-5 py-3 rounded-lg bg-black/80 border border-slate-700 text-sm text-amber-200" data-testid="tv-notice">
+            {notice}
           </div>
         </div>
       )}

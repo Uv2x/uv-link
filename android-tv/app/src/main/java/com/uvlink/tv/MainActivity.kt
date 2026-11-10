@@ -15,12 +15,14 @@ import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
+import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -63,6 +65,13 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
     private lateinit var airPlay: AirPlayReceiver
     private lateinit var updateButton: Button
     private lateinit var updater: TvUpdater
+    private lateinit var layoutHint: TextView
+
+    /** The PC's TV page reports that it is showing a cast (not its waiting screen). */
+    private var pcCasting = false
+    /** How an iPhone shares the screen with the PC cast; ◀ ▶ on the remote change it. */
+    private var dualLayout = DualLayout.SIDE_BY_SIDE
+    private val hideLayoutHint = Runnable { layoutHint.visibility = View.GONE }
 
     private var finder: PcFinder? = null
     private var webView: WebView? = null
@@ -83,6 +92,19 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         root.addView(finderView, FrameLayout.LayoutParams(MATCH, MATCH))
         mirrorView = buildMirrorView()
         root.addView(mirrorView, FrameLayout.LayoutParams(MATCH, MATCH))
+        layoutHint = label("", 16f, Color.WHITE).apply {
+            setBackgroundColor(0xCC020617.toInt())
+            setPadding(dp(18), dp(10), dp(18), dp(10))
+            visibility = View.GONE
+        }
+        root.addView(layoutHint, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(28)
+        })
+        root.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) applyDualLayout()
+        }
+        dualLayout = runCatching { DualLayout.valueOf(prefs().getString(KEY_DUAL_LAYOUT, null) ?: "") }
+            .getOrDefault(DualLayout.SIDE_BY_SIDE)
         setContentView(root)
         airPlay = AirPlayReceiver(this, this)
         updater = TvUpdater(this, this)
@@ -105,6 +127,7 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         disconnect()
         airPlay.stop()
         mirrorView.visibility = View.GONE
+        applyDualLayout()
     }
 
     override fun onDestroy() {
@@ -126,6 +149,7 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
             // Back during iPhone mirroring ends it and returns to what was on screen before.
             airPlay.disconnectSenders()
             mirrorView.visibility = View.GONE
+            applyDualLayout()
         } else if (webView != null) {
             // Back from the cast goes to the PC list instead of closing the app.
             viewerChoosing = true
@@ -134,6 +158,84 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         } else {
             @Suppress("DEPRECATION")
             super.onBackPressed()
+        }
+    }
+
+    /** ◀ ▶ switch between side by side, picture in picture and iPhone full screen. */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val bothOnScreen = mirrorView.visibility == View.VISIBLE && pcCasting && webView != null
+        if (bothOnScreen && (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT || event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                dualLayout = if (event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) dualLayout.next() else dualLayout.previous()
+                prefs().edit().putString(KEY_DUAL_LAYOUT, dualLayout.name).apply()
+                applyDualLayout()
+                showLayoutHint()
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    // ------------------------------------------------------------ PC cast + iPhone together
+
+    /** Places the PC cast and the iPhone for the current layout (see [DualViewLayout]). */
+    private fun applyDualLayout() {
+        val width = root.width
+        val height = root.height
+        if (width == 0 || height == 0) return
+        val phoneOn = mirrorView.visibility == View.VISIBLE
+        val pcOn = pcCasting && webView != null
+        val placement = DualViewLayout.place(dualLayout, width, height, mirrorFrame.aspect, pcOn, phoneOn, dp(24))
+        webView?.let { place(it, placement.pc) }
+        val phone = placement.phone ?: return
+        place(mirrorView, phone)
+        // A thin frame around the picture-in-picture window.
+        val pip = pcOn && dualLayout == DualLayout.PICTURE_IN_PICTURE
+        val frame = if (pip) dp(3) else 0
+        mirrorView.setPadding(frame, frame, frame, frame)
+        mirrorView.setBackgroundColor(if (pip) SLATE_500 else Color.BLACK)
+        // Remote keys go to the big picture: the iPhone when it fills the screen, else the PC page.
+        if (pcOn && dualLayout != DualLayout.PHONE_FULL) webView?.requestFocus() else mirrorView.requestFocus()
+    }
+
+    private fun place(view: View, box: Box) {
+        val params = view.layoutParams as? FrameLayout.LayoutParams ?: FrameLayout.LayoutParams(box.width, box.height)
+        val gravity = Gravity.TOP or Gravity.START
+        if (params.width == box.width && params.height == box.height && params.leftMargin == box.left &&
+            params.topMargin == box.top && params.gravity == gravity
+        ) {
+            return
+        }
+        params.width = box.width
+        params.height = box.height
+        params.leftMargin = box.left
+        params.topMargin = box.top
+        params.gravity = gravity
+        view.layoutParams = params
+    }
+
+    private fun showLayoutHint() {
+        layoutHint.text = getString(R.string.layout_hint, dualLayout.label)
+        layoutHint.visibility = View.VISIBLE
+        main.removeCallbacks(hideLayoutHint)
+        main.postDelayed(hideLayoutHint, LAYOUT_HINT_MS)
+    }
+
+    /**
+     * The PC's TV page (served by the PC app) calls `UvLinkTV.castState("playing" | "waiting" | …)`
+     * so the app knows when there's a cast for an iPhone to share the screen with.
+     */
+    private inner class TvPageBridge(private val owner: WebView) {
+        @JavascriptInterface
+        fun castState(state: String) {
+            main.post {
+                if (owner !== webView) return@post
+                val casting = state == "playing"
+                if (casting == pcCasting) return@post
+                pcCasting = casting
+                applyDualLayout()
+                if (casting && mirrorView.visibility == View.VISIBLE) showLayoutHint()
+            }
         }
     }
 
@@ -224,6 +326,8 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
             // The receiver never needs camera or microphone.
             override fun onPermissionRequest(request: PermissionRequest) = request.deny()
         }
+        // Only for the PC's own pages (shouldOverrideUrlLoading keeps the WebView there).
+        web.addJavascriptInterface(TvPageBridge(web), "UvLinkTV")
 
         // Below the iPhone mirroring layer, which must stay on top.
         root.addView(web, root.indexOfChild(mirrorView), FrameLayout.LayoutParams(MATCH, MATCH))
@@ -254,7 +358,9 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         val web = webView ?: return
         webView = null
         connectedUrl = null
+        pcCasting = false
         root.removeView(web)
+        applyDualLayout()
         web.stopLoading()
         web.loadUrl("about:blank")
         web.destroy()
@@ -401,16 +507,22 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         mirrorStatus.visibility = View.VISIBLE
         mirrorView.visibility = View.VISIBLE
         mirrorView.requestFocus()
+        applyDualLayout()
+        // With a PC cast on screen too, they share it: say how to change the layout.
+        if (pcCasting && webView != null) showLayoutHint()
     }
 
     override fun onMirrorStopped() {
         mirrorView.visibility = View.GONE
+        applyDualLayout()
         (webView ?: finderView).requestFocus()
     }
 
     override fun onVideoSize(width: Int, height: Int) {
         mirrorFrame.aspect = width.toFloat() / height
         mirrorStatus.visibility = View.GONE
+        // Side by side and picture in picture follow the phone's shape (portrait / landscape).
+        applyDualLayout()
     }
 
     override fun onStatus(line: String) {
@@ -461,6 +573,8 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
 
     companion object {
         private const val KEY_LAST_URL = "lastPcUrl"
+        private const val KEY_DUAL_LAYOUT = "dualLayout"
+        private const val LAYOUT_HINT_MS = 4000L
         private const val RETRY_MS = 8000L
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT

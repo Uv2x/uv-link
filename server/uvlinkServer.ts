@@ -17,7 +17,8 @@ import type {
   LiveReceiver,
   PacketDirection,
   PacketLogItem,
-  ServerMessage
+  ServerMessage,
+  TvStatsReport
 } from '../src/shared/protocol';
 import type { UpdateStatus } from '../src/shared/updates';
 import type { PcUpdater } from './pcUpdater';
@@ -81,6 +82,8 @@ interface ReceiverRecord {
   /** Sender client id that is casting to this TV right now. */
   activeSenderId: string | null;
   removalTimer: NodeJS.Timeout | null;
+  /** The TV's latest decoder report, kept for troubleshooting (GET /api/receivers). */
+  lastStats: TvStatsReport | null;
 }
 
 /** IPv4 addresses other devices on the LAN can reach this PC at, most likely first. */
@@ -258,7 +261,12 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
   });
 
   app.get('/api/receivers', (_req, res) => {
-    res.json({ receivers: receiverList(), packetLogs: packetLogs.slice(0, 25) });
+    res.json({
+      receivers: receiverList(),
+      packetLogs: packetLogs.slice(0, 25),
+      // Each TV's last decoder report: codec, frames received vs decoded, freezes, browser.
+      tvStats: Object.fromEntries([...receivers.values()].map((r) => [r.info.id, r.lastStats]))
+    });
   });
 
   // Built installers. Short URLs on purpose: they get typed on a TV remote.
@@ -379,7 +387,8 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
         info: { id, name, device, ip: client.ip, status: 'idle', connectedAt: Date.now() },
         clientId: client.id,
         activeSenderId: null,
-        removalTimer: null
+        removalTimer: null,
+        lastStats: null
       });
       sendTo(client, welcome(client));
       log('TV → Server', 'TV ONLINE', `${name} (${device}) joined from ${client.ip}`);
@@ -465,7 +474,23 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
       case 'tv:stats': {
         const record = client.receiverId ? receivers.get(client.receiverId) : undefined;
         if (client.role !== 'tv' || !record || record.activeSenderId !== msg.to) return;
+        record.lastStats = msg.stats;
         sendTo(clients.get(msg.to), { type: 'tv:stats', from: record.info.id, stats: msg.stats });
+        return;
+      }
+
+      case 'tv:decode-stalled': {
+        const record = client.receiverId ? receivers.get(client.receiverId) : undefined;
+        if (client.role !== 'tv' || !record || record.activeSenderId !== msg.to) return;
+        const codec = typeof msg.codec === 'string' ? msg.codec.slice(0, 16) : null;
+        record.lastStats = msg.stats;
+        sendTo(clients.get(msg.to), { type: 'tv:decode-stalled', from: record.info.id, codec, stats: msg.stats });
+        log(
+          'TV → Sender',
+          'DECODE STALLED',
+          `${record.info.name} receives ${codec ?? 'video'} but can't decode it; switching codec`,
+          size
+        );
         return;
       }
     }

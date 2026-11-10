@@ -16,4 +16,5 @@
     <string name="airplay_hint">iPhone or iPad: open Control Center → Screen Mirroring → %1$s</string>
     <string name="airplay_status">AirPlay: %1$s</string>
     <string name="mirror_connecting">Connecting to %1$s…</string>
+    <string name="layout_hint">◀ ▶  %1$s  ·  Back stops the iPhone</string>
 </resources>

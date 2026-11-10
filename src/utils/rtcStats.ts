@@ -111,11 +111,22 @@ export function createSenderStatsSampler(): (report: StatsReportLike) => SenderS
   };
 }
 
-export function createTvStatsSampler(): (report: StatsReportLike) => TvStatsReport {
+/** "Chrome 91" / "Firefox 120" / "Safari 17" from a user agent; null when unknown. */
+export function browserLabel(userAgent: string): string | null {
+  // Edge's user agent also says "Chrome/", so check for it first.
+  const edge = /Edg\/(\d+)/.exec(userAgent);
+  if (edge) return `Edge ${edge[1]}`;
+  const engine = /(Chrome|Firefox)\/(\d+)/.exec(userAgent);
+  if (engine) return `${engine[1]} ${engine[2]}`;
+  const safari = /Version\/(\d+)[\d.]* .*Safari\//.exec(userAgent);
+  return safari ? `Safari ${safari[1]}` : null;
+}
+
+export function createTvStatsSampler(browser: string | null = null): (report: StatsReportLike) => TvStatsReport {
   let previous: Stat | null = null;
 
   return (report) => {
-    const { all } = collect(report);
+    const { all, byId } = collect(report);
     const inbound = all.find((s) => s.type === 'inbound-rtp' && s.kind === 'video');
 
     let bitrateMbps: number | null = null;
@@ -142,7 +153,14 @@ export function createTvStatsSampler(): (report: StatsReportLike) => TvStatsRepo
       decodeMs,
       framesDropped: num(inbound?.framesDropped),
       packetsLost: num(inbound?.packetsLost),
-      decoder: str(inbound?.decoderImplementation)
+      decoder: str(inbound?.decoderImplementation),
+      codec: codecName(byId, inbound?.codecId),
+      framesReceived: num(inbound?.framesReceived),
+      framesDecoded: num(inbound?.framesDecoded),
+      keyFramesDecoded: num(inbound?.keyFramesDecoded),
+      freezeCount: num(inbound?.freezeCount),
+      pliCount: num(inbound?.pliCount),
+      browser
     };
   };
 }

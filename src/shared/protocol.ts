@@ -45,6 +45,18 @@ export interface TvStatsReport {
   framesDropped: number | null;
   packetsLost: number | null;
   decoder: string | null;
+  /** Video codec being received, e.g. "H264", "VP8". */
+  codec: string | null;
+  /** Complete frames received and frames decoded since the stream started. */
+  framesReceived: number | null;
+  framesDecoded: number | null;
+  keyFramesDecoded: number | null;
+  /** Times the picture froze, by the browser's own freeze detection. */
+  freezeCount: number | null;
+  /** Keyframe requests the TV sent to recover. */
+  pliCount: number | null;
+  /** The TV's browser engine, e.g. "Chrome 91". */
+  browser: string | null;
 }
 
 /** Messages a browser sends to the server. `to` is a TV id (from senders) or a sender client id (from TVs). */
@@ -56,7 +68,9 @@ export type ClientMessage =
   | { type: 'webrtc:answer'; to: string; sdp: string }
   | { type: 'webrtc:ice'; to: string; candidate: RTCIceCandidateInit }
   | { type: 'webrtc:stop'; to: string }
-  | { type: 'tv:stats'; to: string; stats: TvStatsReport };
+  | { type: 'tv:stats'; to: string; stats: TvStatsReport }
+  /** The TV receives frames but its decoder produces none (e.g. a broken hardware H.264 decoder). */
+  | { type: 'tv:decode-stalled'; to: string; codec: string | null; stats: TvStatsReport };
 
 /** Messages the server sends to a browser. `from` is the sender client id (to TVs) or the TV id (to senders). */
 export type ServerMessage =
@@ -76,4 +90,5 @@ export type ServerMessage =
   | { type: 'webrtc:stop'; from: string }
   /** Sent to a sender when its cast can't continue (TV left, another PC took over, ...). */
   | { type: 'webrtc:ended'; receiverId: string; reason: string }
-  | { type: 'tv:stats'; from: string; stats: TvStatsReport };
+  | { type: 'tv:stats'; from: string; stats: TvStatsReport }
+  | { type: 'tv:decode-stalled'; from: string; codec: string | null; stats: TvStatsReport };

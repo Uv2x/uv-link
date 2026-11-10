@@ -16,7 +16,13 @@ import type { LatencyBudgetBreakdown, ZeroLatencyParameters } from '../utils/web
 import type { LiveReceiver, TvStatsReport } from '../shared/protocol';
 import type { SignalingClient } from '../utils/signalingClient';
 import { createSenderStatsSampler, estimateGlassToGlassMs, type SenderStatsSample } from '../utils/rtcStats';
-import { addOrQueueIceCandidate, flushQueuedIceCandidates, preferVideoCodec } from '../utils/peer';
+import {
+  addOrQueueIceCandidate,
+  codecTryOrder,
+  flushQueuedIceCandidates,
+  preferVideoCodec,
+  type VideoCodecName
+} from '../utils/peer';
 
 export type { LiveReceiver, PacketLogItem } from '../shared/protocol';
 
@@ -41,12 +47,55 @@ interface AudioMeter {
 interface CastSession {
   pc: RTCPeerConnection;
   receiverId: string;
+  receiverName: string;
   stream: MediaStream;
   videoSender: RTCRtpSender;
   pendingIce: RTCIceCandidateInit[];
   timers: number[];
   audioCtx: AudioContext | null;
+  /** The video codec offered first (the one the TV is expected to use). */
+  codec: VideoCodecName;
 }
+
+/** What a reconnect needs to start a new peer connection for the same capture. */
+interface PeerTarget {
+  receiverId: string;
+  receiverName: string;
+  stream: MediaStream;
+  audioCtx: AudioContext | null;
+  codec: VideoCodecName;
+  /** Codecs this TV couldn't decode; left out of the offer. */
+  failures: string[];
+}
+
+// Codecs a TV couldn't decode, remembered per TV name so the next cast starts with one that works.
+const CODEC_FAILURES_KEY = 'uvlink.codecFailures';
+
+function readCodecFailures(tvName: string): string[] {
+  try {
+    const all = JSON.parse(localStorage.getItem(CODEC_FAILURES_KEY) ?? '{}') as Record<string, unknown>;
+    const list = all[tvName];
+    return Array.isArray(list) ? list.filter((c): c is string => typeof c === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCodecFailures(tvName: string, failures: string[]): void {
+  try {
+    const all = JSON.parse(localStorage.getItem(CODEC_FAILURES_KEY) ?? '{}') as Record<string, unknown>;
+    if (failures.length) all[tvName] = failures;
+    else delete all[tvName];
+    localStorage.setItem(CODEC_FAILURES_KEY, JSON.stringify(all));
+  } catch {
+    // Storage blocked: the TV just gets the full codec order again next time.
+  }
+}
+
+const codecLabel = (codec: string): string =>
+  ({ H264: 'H.264', H265: 'H.265', VP8: 'VP8', VP9: 'VP9', AV1: 'AV1' })[codec.toUpperCase()] ?? codec;
+
+const preferredCodec = (p: ZeroLatencyParameters): VideoCodecName => (p.codec === 'HEVC_Main10' ? 'H265' : 'H264');
 
 function createAudioMeter(ctx: AudioContext, track: MediaStreamTrack): AudioMeter {
   const source = ctx.createMediaStreamSource(new MediaStream([track]));
@@ -121,6 +170,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   const [senderStats, setSenderStats] = useState<SenderStatsSample | null>(null);
   const [tvStats, setTvStats] = useState<TvStatsReport | null>(null);
   const [copied, setCopied] = useState(false);
+  /** Informational message, e.g. "switched to VP8". */
+  const [notice, setNotice] = useState('');
+  const [activeCodec, setActiveCodec] = useState<VideoCodecName | null>(null);
+  /** Bumped when remembered codec failures change, to re-read them. */
+  const [failuresVersion, setFailuresVersion] = useState(0);
 
   const paramsRef = useRef(params);
   const budgetRef = useRef(budget);
@@ -230,6 +284,15 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, []);
 
+  /** Closes a session's peer connection and timers; the capture keeps running. */
+  const closePeer = useCallback((session: CastSession) => {
+    session.timers.forEach((t) => window.clearTimeout(t));
+    session.timers = [];
+    session.pc.onicecandidate = null;
+    session.pc.onconnectionstatechange = null;
+    session.pc.close();
+  }, []);
+
   /** Releases everything the current cast holds. Safe to call when nothing is running. */
   const releaseSession = useCallback((notifyTv: boolean) => {
     const session = sessionRef.current;
@@ -237,17 +300,14 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     meterRef.current = null;
     tvStatsRef.current = null;
     if (!session) return;
-    session.timers.forEach((t) => window.clearTimeout(t));
-    session.pc.onicecandidate = null;
-    session.pc.onconnectionstatechange = null;
-    session.pc.close();
+    closePeer(session);
     session.stream.getTracks().forEach((track) => {
       track.onended = null;
       track.stop();
     });
     session.audioCtx?.close().catch(() => {});
     if (notifyTv) signalingRef.current?.send({ type: 'webrtc:stop', to: session.receiverId });
-  }, []);
+  }, [closePeer]);
 
   const endCast = useCallback(
     (notifyTv: boolean, errorMessage = '') => {
@@ -258,9 +318,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       setCastReceiverId(null);
       setSenderStats(null);
       setTvStats(null);
+      setActiveCodec(null);
       setIsStreaming(false);
       onLiveStats(null);
       setError(errorMessage);
+      setNotice('');
     },
     [releaseSession, setIsStreaming, onLiveStats]
   );
@@ -285,6 +347,9 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
         void addOrQueueIceCandidate(session.pc, session.pendingIce, msg.candidate);
       } else if (msg.type === 'tv:stats' && msg.from === session.receiverId) {
         tvStatsRef.current = msg.stats;
+      } else if (msg.type === 'tv:decode-stalled' && msg.from === session.receiverId) {
+        tvStatsRef.current = msg.stats;
+        switchCodecRef.current(session, msg.codec);
       } else if (msg.type === 'webrtc:ended' && msg.receiverId === session.receiverId) {
         endCast(false, msg.reason);
       }
@@ -365,10 +430,54 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     }
     videoTrack.contentHint = 'motion';
     const [audioTrack] = stream.getAudioTracks();
+    if (audioTrack) {
+      audioCtx = audioCtx ?? new AudioContext();
+      audioCtx.resume().catch(() => {});
+      meterRef.current = createAudioMeter(audioCtx, audioTrack);
+    }
+    // The browser's own "Stop sharing" button ends the track.
+    videoTrack.onended = () => {
+      if (sessionRef.current?.stream === stream) endCast(true);
+    };
+
+    // Start with a codec this TV can decode: skip ones that froze on it before.
+    const failures = readCodecFailures(target.name);
+    const order = codecTryOrder(preferredCodec(p), failures);
+    const codec = order[0] ?? preferredCodec(p);
+    setNotice(
+      failures.length
+        ? `Sending ${codecLabel(codec)}: ${failures.map(codecLabel).join(' and ')} froze on ${target.name} before.`
+        : ''
+    );
+
+    if (previewVideoRef.current) {
+      previewVideoRef.current.srcObject = stream;
+      previewVideoRef.current.play().catch(() => {});
+    }
+    setActiveSource(source);
+    setCastReceiverId(target.id);
+    setIsStreaming(true);
+    await connectPeer({ receiverId: target.id, receiverName: target.name, stream, audioCtx, codec, failures });
+  };
+
+  /**
+   * Opens a peer connection to the TV for an existing capture and offers `codec` first.
+   * Used for a new cast, and again (same capture) when the TV can't decode the codec.
+   */
+  const connectPeer = async (target: PeerTarget) => {
+    const signalingClient = signalingRef.current;
+    if (!signalingClient) {
+      endCast(false, 'Not connected to the Uv Link server.');
+      return;
+    }
+    const p = paramsRef.current;
+    const { stream } = target;
+    const [videoTrack] = stream.getVideoTracks();
+    const [audioTrack] = stream.getAudioTracks();
 
     const pc = new RTCPeerConnection({ iceServers: [] });
     const videoTransceiver = pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [stream] });
-    preferVideoCodec(videoTransceiver, p.codec === 'HEVC_Main10' ? 'H265' : 'H264');
+    preferVideoCodec(videoTransceiver, target.codec, target.failures);
     if (audioTrack && p.audio.enabled) {
       // Same stream id = the TV lip-syncs audio and video, which holds video back to match
       // the audio buffer (~40-60 ms). A separate stream lets video play as soon as it's decoded.
@@ -378,20 +487,17 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
 
     const session: CastSession = {
       pc,
-      receiverId: target.id,
+      receiverId: target.receiverId,
+      receiverName: target.receiverName,
       stream,
       videoSender: videoTransceiver.sender,
       pendingIce: [],
       timers: [],
-      audioCtx
+      audioCtx: target.audioCtx,
+      codec: target.codec
     };
     sessionRef.current = session;
-
-    if (audioTrack) {
-      session.audioCtx = session.audioCtx ?? new AudioContext();
-      session.audioCtx.resume().catch(() => {});
-      meterRef.current = createAudioMeter(session.audioCtx, audioTrack);
-    }
+    setActiveCodec(target.codec);
 
     try {
       const sendParams = videoTransceiver.sender.getParameters();
@@ -411,7 +517,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        signalingClient.send({ type: 'webrtc:ice', to: target.id, candidate: event.candidate.toJSON() });
+        signalingClient.send({ type: 'webrtc:ice', to: target.receiverId, candidate: event.candidate.toJSON() });
       }
     };
     pc.onconnectionstatechange = () => {
@@ -423,18 +529,6 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
         endCast(true, 'Lost the connection to the TV. Check that the PC and TV are on the same Wi-Fi network.');
       }
     };
-    // The browser's own "Stop sharing" button ends the track.
-    videoTrack.onended = () => {
-      if (sessionRef.current === session) endCast(true);
-    };
-
-    if (previewVideoRef.current) {
-      previewVideoRef.current.srcObject = stream;
-      previewVideoRef.current.play().catch(() => {});
-    }
-    setActiveSource(source);
-    setCastReceiverId(target.id);
-    setIsStreaming(true);
     setPhase('connecting');
 
     try {
@@ -445,7 +539,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       return;
     }
     if (sessionRef.current !== session) return;
-    signalingClient.send({ type: 'webrtc:offer', to: target.id, sdp: pc.localDescription?.sdp ?? '' });
+    // A new offer to the same TV replaces its previous connection (used when switching codec).
+    signalingClient.send({ type: 'webrtc:offer', to: target.receiverId, sdp: pc.localDescription?.sdp ?? '' });
 
     session.timers.push(
       window.setTimeout(() => {
@@ -478,6 +573,41 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     session.timers.push(statsTimer);
   };
 
+  /**
+   * The TV gets frames but can't decode them (on Android, a broken hardware H.264 decoder has no
+   * software fallback, so the picture just freezes). Remember that for this TV and reconnect with
+   * the next codec, keeping the same screen capture.
+   */
+  const switchCodec = (session: CastSession, reportedCodec: string | null) => {
+    if (sessionRef.current !== session) return;
+    const failed = (reportedCodec ?? session.codec).toUpperCase();
+    const failures = Array.from(new Set([...readCodecFailures(session.receiverName), failed]));
+    writeCodecFailures(session.receiverName, failures);
+    setFailuresVersion((v) => v + 1);
+    const next = codecTryOrder(preferredCodec(paramsRef.current), failures)[0];
+    if (!next) {
+      endCast(
+        true,
+        `${session.receiverName} receives the video but can't decode it (tried ${failures.map(codecLabel).join(', ')}). Try the TV's own browser, or another TV.`
+      );
+      return;
+    }
+    setNotice(`${session.receiverName} couldn't decode ${codecLabel(failed)}, so Uv Link switched to ${codecLabel(next)}.`);
+    closePeer(session);
+    tvStatsRef.current = null;
+    setTvStats(null);
+    void connectPeer({
+      receiverId: session.receiverId,
+      receiverName: session.receiverName,
+      stream: session.stream,
+      audioCtx: session.audioCtx,
+      codec: next,
+      failures
+    });
+  };
+  const switchCodecRef = useRef(switchCodec);
+  switchCodecRef.current = switchCodec;
+
   const copyTvUrl = () => {
     if (!tvUrl) return;
     navigator.clipboard
@@ -492,6 +622,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   const selectedReceiver = receivers.find((r) => r.id === selectedReceiverId) ?? null;
   const castReceiver = receivers.find((r) => r.id === castReceiverId) ?? selectedReceiver;
   const busy = phase !== 'idle';
+  // Re-read whenever a failure is recorded or cleared (failuresVersion) or the TV changes.
+  const rememberedFailures = selectedReceiver && failuresVersion >= 0 ? readCodecFailures(selectedReceiver.name) : [];
 
   const statusLabel =
     phase === 'live'
@@ -519,7 +651,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
               </p>
             </div>
             <span className="text-xs font-mono text-slate-400 tabular-nums whitespace-nowrap">
-              {params.targetFps} fps · {params.codec === 'H264_42e01f' ? 'H.264' : 'HEVC'}
+              {params.targetFps} fps · {codecLabel(activeCodec ?? preferredCodec(params))}
             </span>
           </div>
 
@@ -653,6 +785,31 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
             >
               <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
               <span>{error}</span>
+            </p>
+          )}
+          {notice && !error && (
+            <p
+              role="status"
+              data-testid="cast-notice"
+              className="mb-4 text-xs text-sky-200 bg-sky-500/10 border border-sky-500/30 rounded-md px-3 py-2"
+            >
+              {notice}
+            </p>
+          )}
+          {!busy && rememberedFailures.length > 0 && selectedReceiver && (
+            <p className="mb-4 text-xs text-slate-400" data-testid="codec-memory">
+              {selectedReceiver.name} froze with {rememberedFailures.map(codecLabel).join(' and ')} before, so Uv Link
+              skips it.{' '}
+              <button
+                type="button"
+                onClick={() => {
+                  writeCodecFailures(selectedReceiver.name, []);
+                  setFailuresVersion((v) => v + 1);
+                }}
+                className="text-sky-400 hover:text-sky-300 underline"
+              >
+                Try {rememberedFailures.map(codecLabel).join(' and ')} again
+              </button>
             </p>
           )}
         </div>
@@ -807,8 +964,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
           </div>
           <div>
             <span className="text-slate-400 block">TV decoder</span>
-            <span className="font-mono text-slate-200 font-medium block mt-0.5 truncate" title={tvStats?.decoder ?? ''}>
-              {tvStats ? (tvStats.decoder ?? 'name hidden by browser') : '—'}
+            <span
+              className="font-mono text-slate-200 font-medium block mt-0.5 truncate"
+              title={tvStats ? `${tvStats.decoder ?? 'decoder name hidden by browser'} · ${tvStats.browser ?? 'browser unknown'}` : ''}
+            >
+              {tvStats ? `${show(tvStats.codec)} · ${tvStats.decoder ?? tvStats.browser ?? 'name hidden'}` : '—'}
             </span>
           </div>
           <div>
@@ -822,6 +982,22 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
             <span className="font-mono text-slate-200 font-medium block mt-0.5">
               {tvStats ? `${show(tvStats.jitterBufferMs, ' ms')} / ${show(tvStats.decodeMs, ' ms')}` : '—'}
             </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block">TV frames decoded / received</span>
+            <span className="font-mono text-slate-200 font-medium block mt-0.5" data-testid="tv-frames">
+              {tvStats ? `${show(tvStats.framesDecoded)} / ${show(tvStats.framesReceived)}` : '—'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block">TV freezes / keyframe requests</span>
+            <span className="font-mono text-slate-200 font-medium block mt-0.5">
+              {tvStats ? `${show(tvStats.freezeCount)} / ${show(tvStats.pliCount)}` : '—'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block">TV browser</span>
+            <span className="font-mono text-slate-200 font-medium block mt-0.5">{tvStats ? show(tvStats.browser) : '—'}</span>
           </div>
         </div>
       </div>

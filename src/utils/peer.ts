@@ -34,33 +34,58 @@ export async function flushQueuedIceCandidates(
   }
 }
 
+export type VideoCodecName = 'H264' | 'H265' | 'VP8' | 'VP9' | 'AV1';
+
 /**
- * Puts `codec` first in the transceiver's preference list so TVs get a stream their
- * hardware decoder handles (H.264 constrained baseline, packetization-mode=1, first).
- * Leaves the browser's default order alone when the codec isn't available.
+ * Codecs to try for a TV, best first: the preferred one (hardware-decoded on most TVs), then
+ * VP8 and VP9, which browsers can always decode in software. On Android, WebRTC decodes H.264
+ * only in hardware, so a TV with a broken H.264 decoder freezes until another codec is used.
+ * Codecs that already failed on this TV are left out.
  */
-export function preferVideoCodec(transceiver: RTCRtpTransceiver, codec: 'H264' | 'H265'): void {
-  if (typeof transceiver.setCodecPreferences !== 'function') return;
+export function codecTryOrder(preferred: VideoCodecName, failed: readonly string[]): VideoCodecName[] {
+  const failedSet = new Set(failed.map((c) => c.toUpperCase()));
+  const order: VideoCodecName[] = [preferred, 'VP8', 'VP9', 'H264'];
+  return order.filter((codec, i) => order.indexOf(codec) === i && !failedSet.has(codec));
+}
+
+const MEDIA_CODECS = new Set(['h264', 'h265', 'vp8', 'vp9', 'av1']);
+
+/**
+ * Puts `codec` first in the transceiver's preference list (H.264: constrained baseline with
+ * packetization-mode=1 first, which TV hardware decoders handle best) and removes the codecs in
+ * `exclude`, so the TV can't pick them. Returns false when the browser can't do this.
+ */
+export function preferVideoCodec(
+  transceiver: RTCRtpTransceiver,
+  codec: VideoCodecName,
+  exclude: readonly string[] = []
+): boolean {
+  if (typeof transceiver.setCodecPreferences !== 'function') return false;
   const mime = `video/${codec}`.toLowerCase();
+  const excluded = new Set(exclude.map((c) => `video/${c}`.toLowerCase()));
   const score = (c: RTCRtpCodec): number => {
     if (c.mimeType.toLowerCase() !== mime) return 0;
     const fmtp = c.sdpFmtpLine ?? '';
-    return 1 + (fmtp.includes('packetization-mode=1') ? 2 : 0) + (fmtp.includes('42e01f') ? 1 : 0);
+    if (codec === 'H264') return 1 + (fmtp.includes('packetization-mode=1') ? 2 : 0) + (fmtp.includes('42e01f') ? 1 : 0);
+    if (codec === 'VP9') return 1 + (fmtp.includes('profile-id=0') || !fmtp ? 1 : 0);
+    return 1;
   };
 
   // Browsers disagree on whether sender or receiver capabilities are valid here; try both.
   for (const source of [RTCRtpSender, RTCRtpReceiver]) {
     const codecs = source.getCapabilities?.('video')?.codecs;
     if (!codecs?.length) continue;
-    const sorted = [...codecs].sort((a, b) => score(b) - score(a));
-    if (score(sorted[0]) === 0) return;
+    const kept = codecs.filter((c) => !excluded.has(c.mimeType.toLowerCase()));
+    const sorted = [...kept].sort((a, b) => score(b) - score(a));
+    if (!sorted.some((c) => MEDIA_CODECS.has(c.mimeType.toLowerCase().replace('video/', '')))) return false;
     try {
       transceiver.setCodecPreferences(sorted);
-      return;
+      return true;
     } catch {
       // Try the other capability list.
     }
   }
+  return false;
 }
 
 /** Ask the receiver to play frames as soon as they are decoded (no extra buffering). */

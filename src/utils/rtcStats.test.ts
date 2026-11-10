@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSenderStatsSampler, createTvStatsSampler, estimateGlassToGlassMs } from './rtcStats';
+import { browserLabel, createSenderStatsSampler, createTvStatsSampler, estimateGlassToGlassMs } from './rtcStats';
 
 const report = (...stats: Array<Record<string, unknown>>) => new Map(stats.map((s) => [s.id as string, s]));
 
@@ -53,7 +53,7 @@ test('sender sampler falls back to the nominated succeeded pair when transport h
 });
 
 test('TV sampler computes jitter buffer and decode time per frame', () => {
-  const sample = createTvStatsSampler();
+  const sample = createTvStatsSampler('Chrome 91');
   sample(
     report({
       id: 'I1', type: 'inbound-rtp', kind: 'video', timestamp: 1000, bytesReceived: 0,
@@ -61,18 +61,38 @@ test('TV sampler computes jitter buffer and decode time per frame', () => {
     })
   );
   const tv = sample(
-    report({
-      id: 'I1', type: 'inbound-rtp', kind: 'video', timestamp: 2000, bytesReceived: 1_250_000,
-      jitterBufferDelay: 1.3, jitterBufferEmittedCount: 160, totalDecodeTime: 0.62, framesDecoded: 160,
-      framesPerSecond: 60, frameWidth: 1280, frameHeight: 720, framesDropped: 2, packetsLost: 5,
-      decoderImplementation: 'ExternalDecoder'
-    })
+    report(
+      {
+        id: 'I1', type: 'inbound-rtp', kind: 'video', timestamp: 2000, bytesReceived: 1_250_000, codecId: 'C1',
+        jitterBufferDelay: 1.3, jitterBufferEmittedCount: 160, totalDecodeTime: 0.62, framesDecoded: 160,
+        framesReceived: 170, keyFramesDecoded: 1, freezeCount: 3, pliCount: 4,
+        framesPerSecond: 60, frameWidth: 1280, frameHeight: 720, framesDropped: 2, packetsLost: 5,
+        decoderImplementation: 'ExternalDecoder'
+      },
+      { id: 'C1', type: 'codec', timestamp: 2000, mimeType: 'video/VP8' }
+    )
   );
   assert.equal(tv.bitrateMbps, 10);
   assert.equal(tv.jitterBufferMs, 5, '0.3 s over 60 frames = 5 ms');
   assert.equal(tv.decodeMs, 2, '0.12 s over 60 frames = 2 ms');
   assert.equal(tv.framesDropped, 2);
   assert.equal(tv.decoder, 'ExternalDecoder');
+  assert.equal(tv.codec, 'VP8');
+  assert.equal(tv.framesReceived, 170);
+  assert.equal(tv.framesDecoded, 160);
+  assert.equal(tv.freezeCount, 3);
+  assert.equal(tv.pliCount, 4);
+  assert.equal(tv.browser, 'Chrome 91');
+});
+
+test('browserLabel names the engine and major version', () => {
+  assert.equal(
+    browserLabel('Mozilla/5.0 (Linux; Android 9; KONKA 4K Android TV Build/PPR1; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.120 Mobile Safari/537.36 UvLinkTV/1.1.0'),
+    'Chrome 91'
+  );
+  assert.equal(browserLabel('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0 Safari/537.36 Edg/130.0'), 'Edge 130');
+  assert.equal(browserLabel('Mozilla/5.0 (Macintosh) Version/17.4 Safari/605.1.15'), 'Safari 17');
+  assert.equal(browserLabel('curl/8'), null);
 });
 
 test('estimateGlassToGlassMs adds measured parts plus one frame, or returns null when a part is missing', () => {
@@ -82,7 +102,8 @@ test('estimateGlassToGlassMs adds measured parts plus one frame, or returns null
   };
   const tv = {
     fps: 60, width: 1920, height: 1080, bitrateMbps: 20, jitterBufferMs: 5, decodeMs: 2,
-    framesDropped: 0, packetsLost: 0, decoder: 'ExternalDecoder'
+    framesDropped: 0, packetsLost: 0, decoder: 'ExternalDecoder', codec: 'H264', framesReceived: 600,
+    framesDecoded: 600, keyFramesDecoded: 1, freezeCount: 0, pliCount: 0, browser: 'Chrome 130'
   };
   // 3 + 4/2 + 5 + 2 + 16.67 = 28.67
   assert.equal(estimateGlassToGlassMs(sender, tv), 28.7);
