@@ -12,8 +12,8 @@ android {
         applicationId = "com.uvlink.tv"
         minSdk = 23
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     buildFeatures {
@@ -50,4 +50,11 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // Tests only (run on the JVM): the AirPlay receiver against the JDK's Ed25519/X25519,
+    // a real iPhone capture, and a fake iPhone over sockets. The app itself has no dependencies.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.googlecode.plist:dd-plist:1.28")
 }

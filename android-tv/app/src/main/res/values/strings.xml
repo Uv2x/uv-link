@@ -12,4 +12,8 @@
     <string name="checking">Checking %1$s…</string>
     <string name="not_reachable">Couldn\'t reach Uv Link at %1$s.</string>
     <string name="connection_failed">Lost the connection to %1$s (%2$s). Looking again…</string>
+    <string name="airplay_starting">Getting ready for iPhone and iPad…</string>
+    <string name="airplay_hint">iPhone or iPad: open Control Center → Screen Mirroring → %1$s</string>
+    <string name="airplay_status">AirPlay: %1$s</string>
+    <string name="mirror_connecting">Connecting to %1$s…</string>
 </resources>

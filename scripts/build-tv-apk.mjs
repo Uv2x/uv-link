@@ -56,9 +56,11 @@ if (isWindows && !env.JAVA_TOOL_OPTIONS) {
   env.JAVA_TOOL_OPTIONS = '-Djavax.net.ssl.trustStoreType=Windows-ROOT';
 }
 
-console.log(`Building Android TV app with ${path.basename(gradle)} …`);
+console.log(`Testing and building the Android TV app with ${path.basename(gradle)} …`);
+// Unit tests first (AirPlay receiver: crypto, plists, a real iPhone capture, a fake iPhone session).
 // Windows needs a shell to run .bat files, and then the path (with its spaces) must be quoted.
-const result = spawnSync(isWindows ? `"${gradle}"` : gradle, ['assembleRelease', '--no-daemon', '--console=plain'], {
+const tasks = ['testReleaseUnitTest', 'assembleRelease', '--no-daemon', '--console=plain'];
+const result = spawnSync(isWindows ? `"${gradle}"` : gradle, tasks, {
   cwd: androidDir,
   env,
   stdio: 'inherit',

@@ -8,7 +8,7 @@ lets TVs find the PC and sets up the connection; nothing leaves your home networ
 | Part | Where | What it is |
 | --- | --- | --- |
 | PC app (Windows) | `electron-main.cjs`, `server/` | Electron app: runs the server, shares a screen with system sound |
-| TV app (Android TV / Google TV) | `android-tv/` | Kotlin app: finds the PC automatically and plays the cast fullscreen |
+| TV app (Android TV / Google TV) | `android-tv/` | Kotlin app: finds the PC automatically and plays the cast fullscreen; also an AirPlay target for iPhone and iPad |
 | Web app | `src/` | React sender UI, and the TV receiver page (`/?mode=tv`) that works in any browser |
 
 ## Use it
@@ -25,6 +25,20 @@ Tips:
 - *Lip Sync* keeps sound and picture together (best for videos). *Low Delay* gives the lowest
   picture delay (games, desktop). Turn on your TV's Game Mode for the lowest delay overall.
 - PC and TV must be on the same network. Guest Wi-Fi and router "AP isolation" block the connection.
+
+### iPhone and iPad (AirPlay)
+
+While the Uv Link app is open on an Android TV, it is also an AirPlay screen-mirroring target. No
+PC needed and nothing to install on the iPhone:
+
+1. Open **Uv Link** on the TV. Its start screen shows the name it uses, e.g. *Uv Link (Living Room TV)*.
+2. On the iPhone or iPad (same Wi-Fi): **Control Center → Screen Mirroring →** that name.
+3. Press **Back** on the TV remote, or *Stop Mirroring* on the phone, to end it.
+
+The screen and its sound are mirrored (H.264 video, AAC-ELD audio). Not supported yet: playing to the
+TV as an AirPlay *speaker* only (e.g. from the Music app's AirPlay button), and AirPlay while the
+app is closed. The bottom line of the TV's start screen shows the latest AirPlay event, and
+`http://<TV-IP>:7000/uvlink/log` lists recent ones, for troubleshooting.
 
 ## Develop
 
@@ -75,6 +89,8 @@ keytool -genkeypair -v -keystore uvlink-release.jks -alias uvlink -keyalg RSA -k
 Keep the keystore and its passwords safe and out of the repo; a lost key means users must uninstall to update.
 
 Notes:
+- The TV app (`android-tv/`) is licensed under the GPL-3.0 because its AirPlay receiver includes
+  GPL-derived FairPlay code; see [android-tv/NOTICE.md](android-tv/NOTICE.md) for credits.
 - The APK is signed with a local development key (kept in `%USERPROFILE%\.uvlink-build`). Before
   publishing to the Play Store, set up your own signing key in `android-tv/app/build.gradle.kts`.
 - The Windows installer isn't code-signed, so SmartScreen shows "Windows protected your PC" the first

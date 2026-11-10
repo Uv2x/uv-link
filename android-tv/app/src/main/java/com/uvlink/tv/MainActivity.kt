@@ -15,6 +15,8 @@ import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -32,6 +34,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.uvlink.tv.airplay.AirPlayReceiver
 
 /**
  * Uv Link TV receiver.
@@ -39,8 +42,11 @@ import android.widget.TextView
  * Finds the PC running Uv Link (see [PcFinder]), then shows its TV page (`/?mode=tv`) in a
  * fullscreen WebView. The page does the WebRTC receiving; this app adds discovery, autoplay
  * with sound, keep-screen-on and an Android TV launcher entry.
+ *
+ * While the app is open it is also an AirPlay target ([AirPlayReceiver]): an iPhone or iPad can
+ * pick it under Screen Mirroring, and its screen covers everything else until it stops.
  */
-class MainActivity : Activity(), PcFinder.Listener {
+class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var root: FrameLayout
@@ -48,6 +54,12 @@ class MainActivity : Activity(), PcFinder.Listener {
     private lateinit var statusText: TextView
     private lateinit var pcList: LinearLayout
     private lateinit var addressInput: EditText
+    private lateinit var airPlayHint: TextView
+    private lateinit var airPlayStatus: TextView
+    private lateinit var mirrorView: FrameLayout
+    private lateinit var mirrorFrame: AspectFitLayout
+    private lateinit var mirrorStatus: TextView
+    private lateinit var airPlay: AirPlayReceiver
 
     private var finder: PcFinder? = null
     private var webView: WebView? = null
@@ -66,28 +78,35 @@ class MainActivity : Activity(), PcFinder.Listener {
         root.setBackgroundColor(Color.BLACK)
         finderView = buildFinder()
         root.addView(finderView, FrameLayout.LayoutParams(MATCH, MATCH))
+        mirrorView = buildMirrorView()
+        root.addView(mirrorView, FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
+        airPlay = AirPlayReceiver(this, this)
     }
 
     override fun onStart() {
         super.onStart()
         hideSystemBars()
+        airPlay.start()
         if (webView == null) startSearch()
     }
 
     override fun onStop() {
         super.onStop()
-        // Leaving the app ends the cast; coming back finds the PC again.
+        // Leaving the app ends the cast and any iPhone mirroring; coming back starts again.
         main.removeCallbacks(retrySearch)
         finder?.stop()
         finder = null
         disconnect()
+        airPlay.stop()
+        mirrorView.visibility = View.GONE
     }
 
     override fun onDestroy() {
         main.removeCallbacks(retrySearch)
         finder?.stop()
         disconnect()
+        airPlay.shutdown()
         super.onDestroy()
     }
 
@@ -98,7 +117,11 @@ class MainActivity : Activity(), PcFinder.Listener {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (webView != null) {
+        if (mirrorView.visibility == View.VISIBLE) {
+            // Back during iPhone mirroring ends it and returns to what was on screen before.
+            airPlay.disconnectSenders()
+            mirrorView.visibility = View.GONE
+        } else if (webView != null) {
             // Back from the cast goes to the PC list instead of closing the app.
             viewerChoosing = true
             disconnect()
@@ -197,7 +220,8 @@ class MainActivity : Activity(), PcFinder.Listener {
             override fun onPermissionRequest(request: PermissionRequest) = request.deny()
         }
 
-        root.addView(web, FrameLayout.LayoutParams(MATCH, MATCH))
+        // Below the iPhone mirroring layer, which must stay on top.
+        root.addView(web, root.indexOfChild(mirrorView), FrameLayout.LayoutParams(MATCH, MATCH))
         finderView.visibility = View.GONE
         webView = web
         web.requestFocus()
@@ -250,6 +274,10 @@ class MainActivity : Activity(), PcFinder.Listener {
         })
         statusText = label(getString(R.string.searching), 18f, SLATE_300)
         column.addView(statusText)
+        airPlayHint = label(getString(R.string.airplay_starting), 16f, SKY_300).apply {
+            setPadding(0, dp(10), 0, 0)
+        }
+        column.addView(airPlayHint)
 
         pcList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -297,9 +325,74 @@ class MainActivity : Activity(), PcFinder.Listener {
             LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(16) }
         )
 
+        // Latest AirPlay event, so a failed iPhone connection says why on screen.
+        airPlayStatus = label("", 12f, SLATE_500).apply {
+            setPadding(0, dp(20), 0, 0)
+            maxLines = 2
+        }
+        column.addView(airPlayStatus, LinearLayout.LayoutParams(dp(640), WRAP))
+
         return ScrollView(this).apply {
             isFillViewport = true
             addView(column, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+    }
+
+    /** Full-screen layer for iPhone mirroring: black, with the video fitted in the middle. */
+    private fun buildMirrorView(): FrameLayout {
+        val surfaceView = SurfaceView(this).apply {
+            // Above any video surface the WebView may use; still below this window's own views.
+            setZOrderMediaOverlay(true)
+            holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) = airPlay.setSurface(holder.surface)
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+                override fun surfaceDestroyed(holder: SurfaceHolder) = airPlay.setSurface(null)
+            })
+        }
+        mirrorFrame = AspectFitLayout(this).apply {
+            addView(surfaceView, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        // Shown until the first frame arrives, so a stuck connection says why instead of staying black.
+        mirrorStatus = label("", 18f, SLATE_300).apply { setPadding(dp(48), 0, dp(48), 0) }
+        return FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+            // Takes D-pad focus so remote presses don't reach the PC cast underneath.
+            isFocusable = true
+            addView(mirrorFrame, FrameLayout.LayoutParams(MATCH, MATCH))
+            addView(mirrorStatus, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER))
+        }
+    }
+
+    // ------------------------------------------------------------ AirPlay (iPhone / iPad)
+
+    override fun onReady(name: String) {
+        airPlayHint.text = getString(R.string.airplay_hint, name)
+    }
+
+    override fun onMirrorStarted(client: String) {
+        mirrorFrame.aspect = 16f / 9f
+        mirrorStatus.text = getString(R.string.mirror_connecting, client)
+        mirrorStatus.visibility = View.VISIBLE
+        mirrorView.visibility = View.VISIBLE
+        mirrorView.requestFocus()
+    }
+
+    override fun onMirrorStopped() {
+        mirrorView.visibility = View.GONE
+        (webView ?: finderView).requestFocus()
+    }
+
+    override fun onVideoSize(width: Int, height: Int) {
+        mirrorFrame.aspect = width.toFloat() / height
+        mirrorStatus.visibility = View.GONE
+    }
+
+    override fun onStatus(line: String) {
+        val event = line.substringAfter(' ')
+        airPlayStatus.text = getString(R.string.airplay_status, event)
+        if (mirrorView.visibility == View.VISIBLE && mirrorStatus.visibility == View.VISIBLE) {
+            mirrorStatus.text = event
         }
     }
 
@@ -349,6 +442,7 @@ class MainActivity : Activity(), PcFinder.Listener {
         private const val SLATE_300 = 0xFFCBD5E1.toInt()
         private const val SLATE_400 = 0xFF94A3B8.toInt()
         private const val SLATE_500 = 0xFF64748B.toInt()
+        private const val SKY_300 = 0xFF7DD3FC.toInt()
 
         /** "192.168.1.20", "192.168.1.20:3000" or a full URL -> "http://192.168.1.20:3000". */
         fun normalizeAddress(input: String): String? {
