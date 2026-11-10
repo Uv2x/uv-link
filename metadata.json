@@ -1,0 +1,9 @@
+{
+  "name": "AirLink — Sub-20ms 60fps WebRTC Screen Mirroring",
+  "description": "Ultra-low-latency 60fps P2P screen mirroring architecture, live WebRTC LAN signaling workbench, SDP latency configurator, and production Android TV Kotlin + Node.js mDNS code.",
+  "requestFramePermissions": [
+    "display-capture"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

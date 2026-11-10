@@ -1,0 +1,18 @@
+node_modules/
+build/
+# Keep the app icon source in the root build/ folder (electron-builder's resources).
+!/build/
+/build/*
+!/build/icon.png
+dist/
+dist-server/
+release/
+android-tv/.gradle/
+android-tv/local.properties
+# AI Studio's scratch files
+.aistudio/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
