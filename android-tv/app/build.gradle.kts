@@ -20,12 +20,25 @@ android {
         buildConfig = true
     }
 
+    // Your own release key, if provided (GitHub Actions passes it from repository secrets):
+    //   UVLINK_KEYSTORE_FILE, UVLINK_KEYSTORE_PASSWORD, UVLINK_KEY_ALIAS, UVLINK_KEY_PASSWORD
+    // Without it, the APK is signed with this machine's debug key so it still installs.
+    val releaseKeystore = System.getenv("UVLINK_KEYSTORE_FILE")?.takeIf { it.isNotBlank() }
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("UVLINK_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("UVLINK_KEY_ALIAS")
+                keyPassword = System.getenv("UVLINK_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with this PC's local debug key so the APK installs without setting up a keystore.
-            // Before publishing to the Play Store, create your own key and signingConfig.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseKeystore != null) "release" else "debug")
         }
     }
 

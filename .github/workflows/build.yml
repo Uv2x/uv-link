@@ -1,0 +1,126 @@
+# Builds the Android TV app (.apk) and the Windows PC app (.exe) on every push to main,
+# and publishes both as a GitHub Release when you push a version tag:
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Optional repository secrets for signing the TV app with your own key (otherwise each
+# build uses a throwaway debug key, and TVs must uninstall before installing a newer build):
+#   UVLINK_KEYSTORE_BASE64   base64 of your .jks keystore
+#   UVLINK_KEYSTORE_PASSWORD, UVLINK_KEY_ALIAS, UVLINK_KEY_PASSWORD
+
+name: Build Uv Link
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Type check and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm run lint
+      - run: npm test
+
+  tv-apk:
+    name: Android TV app (.apk)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GRADLE_USER_HOME: /home/runner/.gradle
+      UVLINK_KEYSTORE_BASE64: ${{ secrets.UVLINK_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            android-tv/**/*.gradle.kts
+            android-tv/gradle/wrapper/gradle-wrapper.properties
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Use your release signing key
+        if: env.UVLINK_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$UVLINK_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/uvlink-release.jks"
+          echo "UVLINK_KEYSTORE_FILE=$RUNNER_TEMP/uvlink-release.jks" >> "$GITHUB_ENV"
+      - name: Build UvLink-TV.apk
+        run: node scripts/build-tv-apk.mjs
+        env:
+          UVLINK_KEYSTORE_PASSWORD: ${{ secrets.UVLINK_KEYSTORE_PASSWORD }}
+          UVLINK_KEY_ALIAS: ${{ secrets.UVLINK_KEY_ALIAS }}
+          UVLINK_KEY_PASSWORD: ${{ secrets.UVLINK_KEY_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UvLink-TV-apk
+          path: release/UvLink-TV.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  pc-exe:
+    name: Windows PC app (.exe)
+    if: github.event_name != 'pull_request'
+    needs: tv-apk
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The installer ships the TV app so the PC can hand it to TVs at /tv.apk.
+      - uses: actions/download-artifact@v4
+        with:
+          name: UvLink-TV-apk
+          path: release
+      - name: Build UvLink-PC-Setup.exe
+        run: npm run build:pc -- --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UvLink-PC-exe
+          path: release/UvLink-PC-Setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tv-apk, pc-exe]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          release/UvLink-TV.apk release/UvLink-PC-Setup.exe
+          --repo "$GITHUB_REPOSITORY"
+          --title "Uv Link $GITHUB_REF_NAME"
+          --generate-notes

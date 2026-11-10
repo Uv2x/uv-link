@@ -29,7 +29,11 @@ function fail(message) {
 const javaHome = process.env.JAVA_HOME || path.join(toolchain, 'jdk-17');
 const sdkDir = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(toolchain, 'android-sdk');
 if (!fs.existsSync(path.join(javaHome, 'bin', isWindows ? 'java.exe' : 'java'))) fail(`No JDK found at ${javaHome}.`);
-if (!fs.existsSync(path.join(sdkDir, 'platforms', 'android-35'))) fail(`No Android SDK platform 35 found in ${sdkDir}.`);
+if (!fs.existsSync(sdkDir)) fail(`No Android SDK found at ${sdkDir}.`);
+if (!fs.existsSync(path.join(sdkDir, 'platforms', 'android-35'))) {
+  // Gradle installs missing SDK packages itself when the SDK license has been accepted.
+  console.warn(`Android SDK platform 35 not found in ${sdkDir}; Gradle will try to install it.`);
+}
 
 // Prefer the downloaded Gradle (no second download); fall back to the project's wrapper.
 const toolchainGradle = path.join(toolchain, `gradle-${GRADLE_VERSION}`, 'bin', isWindows ? 'gradle.bat' : 'gradle');
@@ -53,7 +57,8 @@ if (isWindows && !env.JAVA_TOOL_OPTIONS) {
 }
 
 console.log(`Building Android TV app with ${path.basename(gradle)} …`);
-const result = spawnSync(`"${gradle}"`, ['assembleRelease', '--no-daemon', '--console=plain'], {
+// Windows needs a shell to run .bat files, and then the path (with its spaces) must be quoted.
+const result = spawnSync(isWindows ? `"${gradle}"` : gradle, ['assembleRelease', '--no-daemon', '--console=plain'], {
   cwd: androidDir,
   env,
   stdio: 'inherit',

@@ -54,6 +54,26 @@ npm run release    # -> release/UvLink-TV.apk and release/UvLink-PC-Setup.exe
 `npm run build:tv` and `npm run build:pc` build them separately. The PC installer bundles the TV app,
 so the PC can hand it to TVs at `/tv.apk`.
 
+### On GitHub
+
+Every push to `main` builds both installers in GitHub Actions (download them from the run's
+**Artifacts**). Pushing a version tag also publishes them as a GitHub Release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+To sign the TV app with your own key (so TVs can update without uninstalling), create a keystore
+once and add these repository secrets: `UVLINK_KEYSTORE_BASE64` (the keystore file, base64),
+`UVLINK_KEYSTORE_PASSWORD`, `UVLINK_KEY_ALIAS`, `UVLINK_KEY_PASSWORD`.
+
+```bash
+keytool -genkeypair -v -keystore uvlink-release.jks -alias uvlink -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Keep the keystore and its passwords safe and out of the repo; a lost key means users must uninstall to update.
+
 Notes:
 - The APK is signed with a local development key (kept in `%USERPROFILE%\.uvlink-build`). Before
   publishing to the Play Store, set up your own signing key in `android-tv/app/build.gradle.kts`.
