@@ -50,6 +50,28 @@ const env = {
   // Holds the debug signing key. Keep this folder: a new key means the TV must uninstall before updating.
   ANDROID_USER_HOME: process.env.ANDROID_USER_HOME || path.join(toolchain, 'android-user-home')
 };
+// The release signing key. TVs only accept an update signed with the same key as the installed
+// app, so local builds use the same key as GitHub Actions (which gets it from repository secrets).
+// Kept outside the repo; back it up. Without it, builds are signed with a throwaway debug key.
+const signingDir = path.join(toolchain, 'signing');
+const keystore = path.join(signingDir, 'uvlink-release.jks');
+const keystoreProps = path.join(signingDir, 'keystore.properties');
+if (!env.UVLINK_KEYSTORE_FILE && fs.existsSync(keystore) && fs.existsSync(keystoreProps)) {
+  const props = Object.fromEntries(
+    fs
+      .readFileSync(keystoreProps, 'utf8')
+      .split(/\r?\n/)
+      .filter((line) => line.includes('=') && !line.startsWith('#'))
+      .map((line) => [line.slice(0, line.indexOf('=')).trim(), line.slice(line.indexOf('=') + 1).trim()])
+  );
+  env.UVLINK_KEYSTORE_FILE = keystore;
+  env.UVLINK_KEYSTORE_PASSWORD = props.storePassword;
+  env.UVLINK_KEY_ALIAS = props.keyAlias;
+  env.UVLINK_KEY_PASSWORD = props.keyPassword;
+  console.log('Signing with the Uv Link release key.');
+} else if (!env.UVLINK_KEYSTORE_FILE) {
+  console.warn('No release key found: signing with a debug key (TVs must uninstall before installing a differently signed build).');
+}
 if (isWindows && !env.JAVA_TOOL_OPTIONS) {
   // Trust the same certificates as Windows. Antivirus HTTPS scanning installs its own root
   // certificate there, and without this Java can't download Gradle plugins ("PKIX path building failed").

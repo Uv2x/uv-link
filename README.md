@@ -71,27 +71,39 @@ so the PC can hand it to TVs at `/tv.apk`.
 ### On GitHub
 
 Every push to `main` builds both installers in GitHub Actions (download them from the run's
-**Artifacts**). Pushing a version tag also publishes them as a GitHub Release:
+**Artifacts**). To publish a release, set the new `"version"` in `package.json` (both apps use it),
+commit, and push a matching tag:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
-To sign the TV app with your own key (so TVs can update without uninstalling), create a keystore
-once and add these repository secrets: `UVLINK_KEYSTORE_BASE64` (the keystore file, base64),
-`UVLINK_KEYSTORE_PASSWORD`, `UVLINK_KEY_ALIAS`, `UVLINK_KEY_PASSWORD`.
+The workflow refuses a tag that doesn't match `package.json`, then publishes `UvLink-PC-Setup.exe`
+and `UvLink-TV.apk` as a GitHub Release.
 
-```bash
-keytool -genkeypair -v -keystore uvlink-release.jks -alias uvlink -keyalg RSA -keysize 2048 -validity 10000
-```
+## Automatic updates
 
-Keep the keystore and its passwords safe and out of the repo; a lost key means users must uninstall to update.
+Installed apps update themselves from this repository's latest GitHub Release (the `repository`
+in `package.json`), and only install files whose SHA-256 matches the checksum GitHub lists:
+
+- **PC app:** checks when it starts and every 6 hours, downloads the new installer in the
+  background, and shows **Restart to update** at the bottom of the window. If you just close Uv Link,
+  the update installs then. The installer runs silently and keeps your settings.
+- **TV app:** checks when it opens (at most once an hour) and shows **Update to Uv Link x.y.z** on its
+  start screen. Android asks you to confirm; the first time it also asks you to allow Uv Link to
+  install apps.
+
+TV updates only install when every APK is signed with the same key. That key lives in
+`%USERPROFILE%\.uvlink-build\signing` (local builds use it automatically) and in the repository
+secrets `UVLINK_KEYSTORE_BASE64`, `UVLINK_KEYSTORE_PASSWORD`, `UVLINK_KEY_ALIAS` and
+`UVLINK_KEY_PASSWORD` (GitHub builds). **Back up that folder.** If the key is lost, every TV has to
+uninstall Uv Link before it can install a new version.
 
 Notes:
 - The TV app (`android-tv/`) is licensed under the GPL-3.0 because its AirPlay receiver includes
   GPL-derived FairPlay code; see [android-tv/NOTICE.md](android-tv/NOTICE.md) for credits.
-- The APK is signed with a local development key (kept in `%USERPROFILE%\.uvlink-build`). Before
-  publishing to the Play Store, set up your own signing key in `android-tv/app/build.gradle.kts`.
+- Without the signing folder (e.g. on another PC), `npm run build:tv` signs with a throwaway debug
+  key, and TVs can't update from that build to a release.
 - The Windows installer isn't code-signed, so SmartScreen shows "Windows protected your PC" the first
-  time: choose **More info → Run anyway**.
+  time: choose **More info → Run anyway**. Automatic updates don't show that warning.

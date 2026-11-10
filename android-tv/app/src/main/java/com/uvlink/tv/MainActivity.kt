@@ -35,6 +35,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.uvlink.tv.airplay.AirPlayReceiver
+import com.uvlink.tv.update.TvUpdater
 
 /**
  * Uv Link TV receiver.
@@ -46,7 +47,7 @@ import com.uvlink.tv.airplay.AirPlayReceiver
  * While the app is open it is also an AirPlay target ([AirPlayReceiver]): an iPhone or iPad can
  * pick it under Screen Mirroring, and its screen covers everything else until it stops.
  */
-class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
+class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdater.Ui {
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var root: FrameLayout
@@ -60,6 +61,8 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
     private lateinit var mirrorFrame: AspectFitLayout
     private lateinit var mirrorStatus: TextView
     private lateinit var airPlay: AirPlayReceiver
+    private lateinit var updateButton: Button
+    private lateinit var updater: TvUpdater
 
     private var finder: PcFinder? = null
     private var webView: WebView? = null
@@ -82,12 +85,14 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
         root.addView(mirrorView, FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
         airPlay = AirPlayReceiver(this, this)
+        updater = TvUpdater(this, this)
     }
 
     override fun onStart() {
         super.onStart()
         hideSystemBars()
         airPlay.start()
+        updater.checkIfDue()
         if (webView == null) startSearch()
     }
 
@@ -279,6 +284,14 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
         }
         column.addView(airPlayHint)
 
+        // Shown only when GitHub has a newer version (see TvUpdater).
+        updateButton = Button(this).apply {
+            isAllCaps = false
+            visibility = View.GONE
+            setOnClickListener { updater.startUpdate() }
+        }
+        column.addView(updateButton, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(12) })
+
         pcList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(16), 0, dp(16))
@@ -362,6 +375,18 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui {
             addView(mirrorFrame, FrameLayout.LayoutParams(MATCH, MATCH))
             addView(mirrorStatus, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER))
         }
+    }
+
+    // ------------------------------------------------------------ Updates
+
+    override fun onUpdateState(text: String?, enabled: Boolean) {
+        if (text == null) {
+            updateButton.visibility = View.GONE
+            return
+        }
+        updateButton.text = text
+        updateButton.isEnabled = enabled
+        updateButton.visibility = View.VISIBLE
     }
 
     // ------------------------------------------------------------ AirPlay (iPhone / iPad)

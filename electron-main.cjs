@@ -9,15 +9,18 @@
  * Try it: npm run electron      (no installer)
  */
 const { app, BrowserWindow, desktopCapturer, dialog, session, shell, Menu } = require('electron');
+const { spawn } = require('child_process');
 const path = require('path');
 
 const PREFERRED_PORT = 3000;
+const INSTALLER_NAME = 'UvLink-PC-Setup.exe';
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   let mainWindow = null;
   let server = null;
+  let updater = null;
 
   app.on('second-instance', () => {
     if (!mainWindow) return;
@@ -43,8 +46,34 @@ if (!app.requestSingleInstanceLock()) {
 
   async function start() {
     const appRoot = app.getAppPath();
-    // Bundled by `npm run build:server`; contains express, ws and bonjour-service.
-    const { startUvLinkServer } = require(path.join(appRoot, 'dist-server', 'uvlinkServer.cjs'));
+    // Bundled by `npm run build:server`; contains express, ws, bonjour-service and the updater.
+    const { startUvLinkServer, createPcUpdater, githubRepoFromUrl } = require(
+      path.join(appRoot, 'dist-server', 'uvlinkServer.cjs')
+    );
+
+    // Updates come from GitHub Releases of the repository in package.json. Only the installed
+    // app updates itself; `npm run electron` (not packaged) leaves your files alone.
+    const pkg = require(path.join(appRoot, 'package.json'));
+    const repo = githubRepoFromUrl((pkg.repository && pkg.repository.url) || '');
+    if (app.isPackaged && repo) {
+      updater = createPcUpdater({
+        currentVersion: app.getVersion(),
+        repo,
+        assetName: INSTALLER_NAME,
+        downloadDir: path.join(app.getPath('userData'), 'updates'),
+        // The installer's own switches: /S silent, --updated keeps settings and shortcuts,
+        // --force-run starts the new version when it's done.
+        install: (installer, relaunch) => {
+          const args = ['--updated', '/S'];
+          if (relaunch) args.push('--force-run');
+          const child = spawn(installer, args, { detached: true, stdio: 'ignore' });
+          child.on('error', (err) => console.error('Uv Link updater: could not start the installer', err));
+          child.unref();
+          if (relaunch) app.quit();
+        },
+        log: (message) => console.log(`Uv Link updater: ${message}`)
+      });
+    }
 
     try {
       server = await startUvLinkServer({
@@ -56,8 +85,11 @@ if (!app.requestSingleInstanceLock()) {
         downloadsDir: app.isPackaged
           ? path.join(process.resourcesPath, 'downloads')
           : path.join(appRoot, 'release'),
-        printBanner: !app.isPackaged
+        printBanner: !app.isPackaged,
+        updater: updater || undefined,
+        appVersion: app.getVersion()
       });
+      if (updater) updater.start();
     } catch (err) {
       dialog.showErrorBox('Uv Link could not start', String(err && err.message ? err.message : err));
       app.quit();
@@ -116,6 +148,11 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(start);
 
   app.on('window-all-closed', async () => {
+    if (updater) {
+      updater.stop();
+      // A downloaded update installs now, silently; the next start is the new version.
+      updater.installOnQuit();
+    }
     if (server) {
       await server.close().catch(() => {});
       server = null;

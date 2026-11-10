@@ -19,6 +19,12 @@ import type {
   PacketLogItem,
   ServerMessage
 } from '../src/shared/protocol';
+import type { UpdateStatus } from '../src/shared/updates';
+import type { PcUpdater } from './pcUpdater';
+
+// The PC app (electron-main.cjs) loads these from the same bundle as the server.
+export { createPcUpdater } from './pcUpdater';
+export { githubRepoFromUrl } from '../src/shared/updates';
 
 export interface UvLinkServerOptions {
   /** Preferred port (default 3000). */
@@ -35,6 +41,10 @@ export interface UvLinkServerOptions {
   advertise?: boolean;
   /** Print the startup banner (default true). */
   printBanner?: boolean;
+  /** The installed PC app's updater (see pcUpdater.ts); absent for the dev server. */
+  updater?: PcUpdater;
+  /** Version reported by /api/update when there is no updater. */
+  appVersion?: string;
 }
 
 export interface RunningUvLinkServer {
@@ -157,7 +167,9 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     staticDir,
     downloadsDir,
     advertise = true,
-    printBanner = true
+    printBanner = true,
+    updater,
+    appVersion = '0.0.0'
   } = options;
 
   /** Set once listening; used in URLs and download scripts. */
@@ -281,71 +293,52 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     res.send(batContent);
   });
 
-  // Authoritative OTA Auto-Updater State (tracks GitHub repo, current & latest versions for TV .APK and PC .EXE)
-  let autoUpdateState = {
-    githubRepo: 'youseffakhouri/uv-link',
-    channel: 'stable',
-    autoCheckEnabled: true,
-    currentVersion: '2.4.0',
-    latestVersion: '2.5.0',
-    updateAvailable: true,
-    lastChecked: new Date().toISOString().slice(11, 19),
-    releaseNotes: 'v2.5.0: Added Hardware ABR 60fps lock, 10ms Stereo AAudio lip-sync, and iOS/Android native Screen Mirroring tab discovery.',
-    assets: {
-      tvApk: 'UvLink-TV-Receiver-v2.5.0.apk',
-      pcExe: 'UvLink-PC-Sender-Setup-2.5.0.exe'
-    }
+  // ---------------------------------------------------------------- Updates (PC app)
+
+  /** Only the PC app's own window (localhost) may check or install; other devices just see the status. */
+  const isLocalRequest = (req: express.Request) =>
+    ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '');
+
+  const updateStatus = (req: express.Request): UpdateStatus =>
+    updater
+      ? { ...updater.status(), canControl: isLocalRequest(req) }
+      : {
+          state: 'disabled',
+          currentVersion: appVersion,
+          latestVersion: null,
+          progress: null,
+          error: null,
+          releaseUrl: null,
+          checkedAt: null,
+          canControl: false
+        };
+
+  /** JSON requests only: a web page on another site can't send those to localhost without CORS. */
+  const allowUpdateControl = (req: express.Request, res: express.Response): boolean => {
+    if (updater && isLocalRequest(req) && req.is('application/json')) return true;
+    res.status(403).json({ error: 'Only the Uv Link PC app can do this.' });
+    return false;
   };
 
-  app.get('/api/autoupdate/status', (_req, res) => {
-    res.json(autoUpdateState);
+  app.get('/api/update', (req, res) => {
+    res.json(updateStatus(req));
   });
 
-  app.post('/api/autoupdate/check', async (req, res) => {
-    const repoInput = typeof req.body?.githubRepo === 'string' && req.body.githubRepo.trim()
-      ? req.body.githubRepo.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\/$/, '')
-      : autoUpdateState.githubRepo;
+  app.post('/api/update/check', async (req, res) => {
+    if (!allowUpdateControl(req, res)) return;
+    await updater!.check();
+    res.json(updateStatus(req));
+  });
 
-    autoUpdateState.githubRepo = repoInput;
-    autoUpdateState.lastChecked = new Date().toISOString().slice(11, 19);
-
-    // Query live GitHub Releases API if reachable, otherwise use deterministic OTA manifest
-    try {
-      const ghRes = await fetch(`https://api.github.com/repos/${repoInput}/releases/latest`, {
-        headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'UvLink-AutoUpdater/2.5' }
-      });
-      if (ghRes.ok) {
-        const ghData = await ghRes.json() as { tag_name?: string; body?: string };
-        if (ghData.tag_name) {
-          const cleanVer = ghData.tag_name.replace(/^v/, '');
-          autoUpdateState.latestVersion = cleanVer;
-          autoUpdateState.updateAvailable = cleanVer !== autoUpdateState.currentVersion;
-          if (ghData.body) {
-            autoUpdateState.releaseNotes = ghData.body.slice(0, 180);
-          }
-        }
-      }
-    } catch {
-      // Offline LAN fallback uses built-in OTA manifest
+  app.post('/api/update/install', (req, res) => {
+    if (!allowUpdateControl(req, res)) return;
+    if (updater!.status().state !== 'ready') {
+      res.status(409).json(updateStatus(req));
+      return;
     }
-
-    log(
-      'Server',
-      'OTA AUTO-UPDATE CHECK',
-      `Checked github.com/${autoUpdateState.githubRepo}/releases/latest — Latest: v${autoUpdateState.latestVersion} (Installed: v${autoUpdateState.currentVersion})`
-    );
-    res.json(autoUpdateState);
-  });
-
-  app.post('/api/autoupdate/apply', (_req, res) => {
-    autoUpdateState = {
-      ...autoUpdateState,
-      currentVersion: autoUpdateState.latestVersion,
-      updateAvailable: false,
-      lastChecked: new Date().toISOString().slice(11, 19)
-    };
-    log('Server', 'OTA UPDATE APPLIED', `Version marker set to v${autoUpdateState.currentVersion}`);
-    res.json(autoUpdateState);
+    res.status(202).json(updateStatus(req));
+    // Reply first: installing quits the app.
+    setTimeout(() => updater!.installNow(), 300);
   });
 
   // ---------------------------------------------------------------- Signaling

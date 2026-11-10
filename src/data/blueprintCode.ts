@@ -784,8 +784,8 @@ import java.io.IOException
  */
 class TvOtaAutoUpdater(
     private val context: Context,
-    private val githubRepo: String = "youseffakhouri/uv-link",
-    private val currentVersion: String = "2.4.0"
+    private val githubRepo: String = "Uv2x/uv-link",
+    private val currentVersion: String = "1.1.0"
 ) {
     private val client = OkHttpClient()
 

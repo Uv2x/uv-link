@@ -2,9 +2,13 @@
   "name": "uv-link",
   "productName": "Uv Link",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cast your PC screen and sound to any TV on your Wi-Fi.",
   "author": "Uv Link",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Uv2x/uv-link.git"
+  },
   "type": "module",
   "main": "electron-main.cjs",
   "scripts": {
@@ -20,7 +24,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test \"src/**/*.test.ts\""
+    "test": "tsx --test \"src/**/*.test.ts\" \"server/**/*.test.ts\""
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

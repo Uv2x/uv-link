@@ -1,9 +1,11 @@
 # Builds the Android TV app (.apk) and the Windows PC app (.exe) on every push to main,
-# and publishes both as a GitHub Release when you push a version tag:
-#   git tag v1.0.0 && git push origin v1.0.0
+# and publishes both as a GitHub Release when you push a version tag. The tag must match the
+# "version" in package.json, which both apps report and their updaters compare against:
+#   git tag v1.1.0 && git push origin v1.1.0
+# Installed PC apps and TV apps find that release and update themselves.
 #
-# Optional repository secrets for signing the TV app with your own key (otherwise each
-# build uses a throwaway debug key, and TVs must uninstall before installing a newer build):
+# Repository secrets for signing the TV app with the release key (TV updates need every build
+# signed with the same key; without them each build uses a throwaway debug key):
 #   UVLINK_KEYSTORE_BASE64   base64 of your .jks keystore
 #   UVLINK_KEYSTORE_PASSWORD, UVLINK_KEY_ALIAS, UVLINK_KEY_PASSWORD
 
@@ -33,6 +35,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Release tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match package.json version $VERSION. The apps report the package.json version, so the updaters would loop."
+            exit 1
+          fi
       - run: npm ci
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
@@ -42,6 +52,7 @@ jobs:
   tv-apk:
     name: Android TV app (.apk)
     if: github.event_name != 'pull_request'
+    needs: check
     runs-on: ubuntu-latest
     env:
       GRADLE_USER_HOME: /home/runner/.gradle
