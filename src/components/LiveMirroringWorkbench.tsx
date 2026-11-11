@@ -17,6 +17,12 @@ import type { LiveReceiver, TvStatsReport } from '../shared/protocol';
 import type { SignalingClient } from '../utils/signalingClient';
 import { createSenderStatsSampler, estimateGlassToGlassMs, type SenderStatsSample } from '../utils/rtcStats';
 import {
+  createDecodeLoadController,
+  fitScale,
+  type DecodeLoadDecision,
+  type DecodeLoadSample
+} from '../utils/decodeLoad';
+import {
   addOrQueueIceCandidate,
   codecTryOrder,
   flushQueuedIceCandidates,
@@ -37,6 +43,8 @@ type CastPhase = 'idle' | 'capturing' | 'connecting' | 'live';
 
 /** Give up if the TV hasn't connected within this time. */
 const CONNECT_TIMEOUT_MS = 15000;
+/** When the TV is this far behind, reconnect (dropping its queue) instead of only shrinking. */
+const BACKLOG_RESTART_MS = 1000;
 
 interface AudioMeter {
   left: AnalyserNode;
@@ -55,6 +63,17 @@ interface CastSession {
   audioCtx: AudioContext | null;
   /** The video codec offered first (the one the TV is expected to use). */
   codec: VideoCodecName;
+  /** Capture size, e.g. 3440x1440 for an ultrawide screen. */
+  sourceWidth: number;
+  sourceHeight: number;
+  /** scaleResolutionDownBy that fits the capture into the TV's 1920x1080 picture. */
+  fit: number;
+  /** Extra downscale and frame-rate cap while the TV can't decode fast enough. */
+  extraScale: number;
+  fpsCap: number;
+  decodeLoad: (sample: DecodeLoadSample) => DecodeLoadDecision;
+  /** The TV report the decode-load controller saw last (reports arrive once a second). */
+  lastTvStats: TvStatsReport | null;
 }
 
 /** What a reconnect needs to start a new peer connection for the same capture. */
@@ -66,10 +85,14 @@ interface PeerTarget {
   codec: VideoCodecName;
   /** Codecs this TV couldn't decode; left out of the offer. */
   failures: string[];
+  /** Size / frame-rate limits to keep when reconnecting with the same codec. */
+  load?: { extraScale: number; fpsCap: number; decodeLoad: (sample: DecodeLoadSample) => DecodeLoadDecision };
 }
 
 // Codecs a TV couldn't decode, remembered per TV name so the next cast starts with one that works.
-const CODEC_FAILURES_KEY = 'uvlink.codecFailures';
+// v2: failures recorded before 1.1.2 happened at full screen size (e.g. 3440x1440); now that the
+// picture is sized for the TV, H.264 may decode in hardware after all, so it gets another try.
+const CODEC_FAILURES_KEY = 'uvlink.codecFailures.v2';
 
 function readCodecFailures(tvName: string): string[] {
   try {
@@ -175,6 +198,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   const [activeCodec, setActiveCodec] = useState<VideoCodecName | null>(null);
   /** Bumped when remembered codec failures change, to re-read them. */
   const [failuresVersion, setFailuresVersion] = useState(0);
+  /** What the encoder is sized to and why, e.g. "Sending 1920x804 to fit the TV". */
+  const [sizeNote, setSizeNote] = useState('');
 
   const paramsRef = useRef(params);
   const budgetRef = useRef(budget);
@@ -187,24 +212,53 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     signalingRef.current = signaling;
   }, [signaling]);
 
+  /**
+   * Encoder size, frame rate and bitrate for a session: the bitrate settings' choice, but never
+   * larger than the TV shows (fit) and smaller still while the TV can't decode fast enough.
+   */
+  const encodingFor = useCallback((session: CastSession) => {
+    const p = paramsRef.current;
+    const abr = budgetRef.current.abrDecision;
+    const scale = Math.max(abr.scaleResolutionDownBy, session.fit * session.extraScale);
+    return {
+      scale,
+      fps: Math.min(p.targetFps, session.fpsCap),
+      maxBitrate: abr.targetBitrateKbps * 1000,
+      width: Math.round(session.sourceWidth / scale),
+      height: Math.round(session.sourceHeight / scale)
+    };
+  }, []);
+
+  const applyEncoding = useCallback(
+    async (session: CastSession) => {
+      const encoding = encodingFor(session);
+      try {
+        const rtpParams = session.videoSender.getParameters();
+        rtpParams.degradationPreference = paramsRef.current.degradationPreference;
+        rtpParams.encodings = [
+          {
+            ...(rtpParams.encodings?.[0] ?? {}),
+            maxBitrate: encoding.maxBitrate,
+            maxFramerate: encoding.fps,
+            scaleResolutionDownBy: encoding.scale
+          }
+        ];
+        await session.videoSender.setParameters(rtpParams);
+      } catch (err) {
+        console.warn('Uv Link: could not update encoder settings', err);
+      }
+      return encoding;
+    },
+    [encodingFor]
+  );
+
   // Re-apply the bitrate / fps / resolution caps whenever the ABR decision changes mid-cast.
   useEffect(() => {
-    const sender = sessionRef.current?.videoSender;
-    if (!sender || !isStreaming) return;
-    try {
-      const rtpParams = sender.getParameters();
-      rtpParams.degradationPreference = params.degradationPreference;
-      if (!rtpParams.encodings || rtpParams.encodings.length === 0) {
-        rtpParams.encodings = [{}];
-      }
-      rtpParams.encodings[0].maxBitrate = budget.abrDecision.targetBitrateKbps * 1000;
-      rtpParams.encodings[0].maxFramerate = params.targetFps;
-      rtpParams.encodings[0].scaleResolutionDownBy = budget.abrDecision.scaleResolutionDownBy;
-      sender.setParameters(rtpParams).catch((err) => console.warn('Uv Link: setParameters failed', err));
-    } catch (err) {
-      console.warn('Uv Link: could not update encoder settings', err);
-    }
+    const session = sessionRef.current;
+    if (!session || !isStreaming) return;
+    void applyEncoding(session);
   }, [
+    applyEncoding,
     isStreaming,
     params.degradationPreference,
     params.targetFps,
@@ -323,6 +377,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       onLiveStats(null);
       setError(errorMessage);
       setNotice('');
+      setSizeNote('');
     },
     [releaseSession, setIsStreaming, onLiveStats]
   );
@@ -485,6 +540,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [audioStream] });
     }
 
+    // Never send more pixels than the TV shows; an ultrawide 3440x1440 becomes 1920x804.
+    const settings = videoTrack.getSettings();
+    const sourceWidth = settings.width ?? 1920;
+    const sourceHeight = settings.height ?? 1080;
+    const fit = fitScale(sourceWidth, sourceHeight);
     const session: CastSession = {
       pc,
       receiverId: target.receiverId,
@@ -494,26 +554,29 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       pendingIce: [],
       timers: [],
       audioCtx: target.audioCtx,
-      codec: target.codec
+      codec: target.codec,
+      sourceWidth,
+      sourceHeight,
+      fit,
+      extraScale: target.load?.extraScale ?? 1,
+      fpsCap: target.load?.fpsCap ?? p.targetFps,
+      decodeLoad:
+        target.load?.decodeLoad ??
+        createDecodeLoadController({ targetFps: p.targetFps, fittedWidth: Math.round(sourceWidth / fit) }),
+      lastTvStats: null
     };
     sessionRef.current = session;
     setActiveCodec(target.codec);
 
-    try {
-      const sendParams = videoTransceiver.sender.getParameters();
-      sendParams.degradationPreference = p.degradationPreference;
-      sendParams.encodings = [
-        {
-          ...(sendParams.encodings?.[0] ?? {}),
-          maxBitrate: budgetRef.current.abrDecision.targetBitrateKbps * 1000,
-          maxFramerate: p.targetFps,
-          scaleResolutionDownBy: budgetRef.current.abrDecision.scaleResolutionDownBy
-        }
-      ];
-      await videoTransceiver.sender.setParameters(sendParams);
-    } catch (err) {
-      console.warn('Uv Link: initial encoder settings not applied', err);
-    }
+    const initial = await applyEncoding(session);
+    const holdingBack = session.extraScale > 1 || session.fpsCap < p.targetFps;
+    setSizeNote(
+      holdingBack
+        ? `Sending ${initial.width}x${initial.height} at ${initial.fps} fps so the TV keeps up.`
+        : fit > 1
+          ? `Sending ${initial.width}x${initial.height} (your ${sourceWidth}x${sourceHeight} screen, sized for the TV).`
+          : ''
+    );
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -563,6 +626,33 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       try {
         const senderSample = sample(await pc.getStats());
         const tv = tvStatsRef.current;
+        // Keep the picture small enough for the TV to decode every frame in time.
+        if (tv && tv !== session.lastTvStats) {
+          session.lastTvStats = tv;
+          const decision = session.decodeLoad({ decodeMs: tv.decodeMs, jitterBufferMs: tv.jitterBufferMs });
+          if (decision.exhausted) {
+            // Even the smallest picture at 30 fps is too much: this codec is too heavy for the TV.
+            switchCodecRef.current(session, session.codec, 'fast enough');
+            return;
+          }
+          if (decision.change) {
+            session.extraScale = decision.extraScale;
+            session.fpsCap = decision.fps;
+            const backlogMs = tv.jitterBufferMs ?? 0;
+            if (backlogMs > BACKLOG_RESTART_MS) {
+              // Frames the TV already queued would keep it seconds behind; a fresh connection drops them.
+              setSizeNote(
+                `Reconnecting smaller: the TV was ${(backlogMs / 1000).toFixed(1)} s behind because ${decision.change}.`
+              );
+              restartPeerRef.current(session);
+              return;
+            }
+            const applied = await applyEncoding(session);
+            if (sessionRef.current === session) {
+              setSizeNote(`Sending ${applied.width}x${applied.height} at ${applied.fps} fps: ${decision.change}.`);
+            }
+          }
+        }
         setSenderStats(senderSample);
         setTvStats(tv);
         onLiveStats({ sender: senderSample, tv, estimatedDelayMs: estimateGlassToGlassMs(senderSample, tv) });
@@ -578,9 +668,10 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
    * software fallback, so the picture just freezes). Remember that for this TV and reconnect with
    * the next codec, keeping the same screen capture.
    */
-  const switchCodec = (session: CastSession, reportedCodec: string | null) => {
+  const switchCodec = (session: CastSession, reportedCodec: string | null, how = '') => {
     if (sessionRef.current !== session) return;
     const failed = (reportedCodec ?? session.codec).toUpperCase();
+    const couldnt = `couldn't decode ${codecLabel(failed)}${how ? ` ${how}` : ''}`;
     const failures = Array.from(new Set([...readCodecFailures(session.receiverName), failed]));
     writeCodecFailures(session.receiverName, failures);
     setFailuresVersion((v) => v + 1);
@@ -592,7 +683,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       );
       return;
     }
-    setNotice(`${session.receiverName} couldn't decode ${codecLabel(failed)}, so Uv Link switched to ${codecLabel(next)}.`);
+    setNotice(`${session.receiverName} ${couldnt}, so Uv Link switched to ${codecLabel(next)}.`);
     closePeer(session);
     tvStatsRef.current = null;
     setTvStats(null);
@@ -607,6 +698,24 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   };
   const switchCodecRef = useRef(switchCodec);
   switchCodecRef.current = switchCodec;
+
+  /** Same codec, smaller picture, fresh connection: drops the frames the TV had queued up. */
+  const restartPeer = (session: CastSession) => {
+    if (sessionRef.current !== session) return;
+    closePeer(session);
+    tvStatsRef.current = null;
+    void connectPeer({
+      receiverId: session.receiverId,
+      receiverName: session.receiverName,
+      stream: session.stream,
+      audioCtx: session.audioCtx,
+      codec: session.codec,
+      failures: readCodecFailures(session.receiverName),
+      load: { extraScale: session.extraScale, fpsCap: session.fpsCap, decodeLoad: session.decodeLoad }
+    });
+  };
+  const restartPeerRef = useRef(restartPeer);
+  restartPeerRef.current = restartPeer;
 
   const copyTvUrl = () => {
     if (!tvUrl) return;
@@ -1000,6 +1109,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
             <span className="font-mono text-slate-200 font-medium block mt-0.5">{tvStats ? show(tvStats.browser) : '—'}</span>
           </div>
         </div>
+        {busy && sizeNote && (
+          <p className="mt-3 text-xs text-slate-400" data-testid="tv-size-note">
+            {sizeNote}
+          </p>
+        )}
       </div>
     </section>
   );

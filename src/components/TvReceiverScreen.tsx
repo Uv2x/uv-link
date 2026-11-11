@@ -188,15 +188,42 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
       // Frames arriving but none decoded = this TV can't decode the codec (common with broken
       // hardware H.264 decoders on Android TVs). Tell the PC once; it reconnects with another codec.
       const decodeStalled = createDecodeWatchdog();
-      // Testing aid: /?mode=tv&debugStall=H264 pretends H.264 can't be decoded here.
-      const debugStall = new URLSearchParams(window.location.search).get('debugStall')?.toUpperCase() ?? null;
+      // Testing aids: /?mode=tv&debugStall=H264 pretends H.264 can't be decoded here;
+      // &debugFreeze=VP8 pretends the VP8 picture stops updating on screen.
+      const debugParams = new URLSearchParams(window.location.search);
+      const debugStall = debugParams.get('debugStall')?.toUpperCase() ?? null;
+      const debugFreeze = debugParams.get('debugFreeze')?.toUpperCase() ?? null;
+      const debugSlow = debugParams.get('debugSlow')?.toUpperCase() ?? null;
       const startedAt = Date.now();
       let stallReported = false;
+      let currentCodec: string | null = null;
+
+      // What the viewer actually sees: frames the <video> element puts on screen. Some TVs decode
+      // frames (so the counters above look fine) but never show them, and the picture freezes.
+      const pictureStalled = createDecodeWatchdog();
+      type FrameCallbackVideo = HTMLVideoElement & { requestVideoFrameCallback?: (callback: () => void) => number };
+      const video = videoRef.current as FrameCallbackVideo | null;
+      let shownFrames: number | null = null;
+      if (video && typeof video.requestVideoFrameCallback === 'function') {
+        shownFrames = 0;
+        const onFrameShown = () => {
+          if (sessionRef.current !== session) return;
+          const frozenForTest = debugFreeze !== null && currentCodec?.toUpperCase() === debugFreeze && Date.now() - startedAt > 3000;
+          if (!frozenForTest) shownFrames = (shownFrames ?? 0) + 1;
+          video.requestVideoFrameCallback!(onFrameShown);
+        };
+        video.requestVideoFrameCallback(onFrameShown);
+      }
       session.statsTimer = window.setInterval(async () => {
         if (sessionRef.current !== session) return;
         try {
           const report = await pc.getStats();
-          const stats = sample(report);
+          const measured = sample(report);
+          // Testing aid: &debugSlow=VP8 reports 60 ms per frame and a 3 s backlog for VP8.
+          const stats =
+            debugSlow !== null && measured.codec?.toUpperCase() === debugSlow
+              ? { ...measured, decodeMs: 60, jitterBufferMs: 3000 }
+              : measured;
           setLiveInfo({ fps: stats.fps, width: stats.width, height: stats.height });
           client.send({ type: 'tv:stats', to: senderId, stats });
 
@@ -206,16 +233,25 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
               bytesReceived = s.bytesReceived;
             }
           });
-          const stalled = decodeStalled({
-            timestampMs: Date.now(),
+          currentCodec = stats.codec;
+          const now = Date.now();
+          const notDecoding = decodeStalled({
+            timestampMs: now,
             framesReceived: stats.framesReceived,
             framesDecoded: stats.framesDecoded,
             bytesReceived
           });
-          const simulated = debugStall !== null && stats.codec?.toUpperCase() === debugStall && Date.now() - startedAt > 3000;
-          if (!stallReported && (stalled || simulated)) {
+          // Only judge the picture while it's supposed to be playing and visible, and once a frame
+          // has been shown (so a page that never paints, e.g. a hidden window, can't trigger a switch).
+          const watchingPicture =
+            shownFrames !== null && shownFrames > 0 && !!video && !video.paused && document.visibilityState === 'visible';
+          const notShowing =
+            watchingPicture &&
+            pictureStalled({ timestampMs: now, framesReceived: stats.framesReceived, framesDecoded: shownFrames, bytesReceived });
+          const simulated = debugStall !== null && stats.codec?.toUpperCase() === debugStall && now - startedAt > 3000;
+          if (!stallReported && (notDecoding || notShowing || simulated)) {
             stallReported = true;
-            setNotice(`This TV couldn't decode ${stats.codec ?? 'the video'}. Switching to another format…`);
+            setNotice(`The picture froze with ${stats.codec ?? 'this video format'}. Switching to another format…`);
             client.send({ type: 'tv:decode-stalled', to: senderId, codec: stats.codec, stats });
           }
         } catch {
