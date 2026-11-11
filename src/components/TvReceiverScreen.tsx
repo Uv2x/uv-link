@@ -68,6 +68,11 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
   const inTvApp = query.get('app') === 'android';
   const [tvId] = useState(getOrCreateTvId);
   const [device] = useState(() => query.get('device')?.slice(0, 40) || describeDevice());
+  // The Android TV app passes its display's highest refresh rate (e.g. hz=120); browsers can't tell.
+  const [maxFps] = useState(() => {
+    const hz = Number(query.get('hz'));
+    return Number.isFinite(hz) && hz >= 24 && hz <= 240 ? Math.round(hz) : undefined;
+  });
   const [name, setName] = useState(
     () =>
       readStorage(() => localStorage, TV_NAME_KEY) ||
@@ -226,6 +231,12 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
               : measured;
           setLiveInfo({ fps: stats.fps, width: stats.width, height: stats.height });
           client.send({ type: 'tv:stats', to: senderId, stats });
+          // The TV app switches the display to 120 Hz while a high frame rate arrives.
+          try {
+            (window as unknown as { UvLinkTV?: { castFps?: (fps: number) => void } }).UvLinkTV?.castFps?.(stats.fps ?? 0);
+          } catch {
+            // Older TV app without this bridge method.
+          }
 
           let bytesReceived: number | null = null;
           report.forEach((s) => {
@@ -268,7 +279,8 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
       role: 'tv',
       tvId,
       name: nameRef.current,
-      device
+      device,
+      maxFps
     }));
     clientRef.current = client;
 
@@ -294,7 +306,7 @@ export const TvReceiverScreen: React.FC<TvReceiverScreenProps> = ({ onExit }) =>
       client.close();
       clientRef.current = null;
     };
-  }, [tvId, device, acceptOffer, endSession, teardown]);
+  }, [tvId, device, maxFps, acceptOffer, endSession, teardown]);
 
   // Show the HUD on any activity; hide it again while video is playing.
   const pokeHud = useCallback(() => {

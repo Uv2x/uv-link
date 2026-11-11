@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
+import android.view.Display
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.SurfaceHolder
@@ -38,6 +39,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.uvlink.tv.airplay.AirPlayReceiver
 import com.uvlink.tv.update.TvUpdater
+import kotlin.math.roundToInt
 
 /**
  * Uv Link TV receiver.
@@ -69,6 +71,8 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
 
     /** The PC's TV page reports that it is showing a cast (not its waiting screen). */
     private var pcCasting = false
+    /** The display is in its fastest refresh mode for a 120 fps cast. */
+    private var highRefresh = false
     /** How an iPhone shares the screen with the PC cast; ◀ ▶ on the remote change it. */
     private var dualLayout = DualLayout.SIDE_BY_SIDE
     private val hideLayoutHint = Runnable { layoutHint.visibility = View.GONE }
@@ -226,6 +230,16 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
      * so the app knows when there's a cast for an iPhone to share the screen with.
      */
     private inner class TvPageBridge(private val owner: WebView) {
+        /** Frames per second the cast is arriving at (once a second while playing). */
+        @JavascriptInterface
+        fun castFps(fps: Double) {
+            main.post {
+                if (owner !== webView) return@post
+                // Hysteresis: switch up above 90 fps, back down below 70.
+                if (fps >= 90) useHighRefresh(true) else if (fps in 1.0..70.0) useHighRefresh(false)
+            }
+        }
+
         @JavascriptInterface
         fun castState(state: String) {
             main.post {
@@ -344,8 +358,37 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
             .appendQueryParameter("app", "android")
             .appendQueryParameter("device", if (isTv()) "Android TV" else "Android")
             .appendQueryParameter("name", Build.MODEL ?: "Android TV")
+            // Highest refresh rate at the current resolution, so the PC only sends 120 fps to 120 Hz TVs.
+            .appendQueryParameter("hz", maxRefreshRate().toString())
             .build()
             .toString()
+
+    @Suppress("DEPRECATION")
+    private fun currentDisplay(): Display = windowManager.defaultDisplay
+
+    /** Display modes with the same resolution as now (changing resolution would rescale everything). */
+    private fun sameResolutionModes(): List<Display.Mode> {
+        val display = currentDisplay()
+        val now = display.mode
+        return display.supportedModes.filter {
+            it.physicalWidth == now.physicalWidth && it.physicalHeight == now.physicalHeight
+        }
+    }
+
+    private fun maxRefreshRate(): Int = sameResolutionModes().maxOfOrNull { it.refreshRate }?.roundToInt() ?: 60
+
+    /** While a high frame rate arrives, switch the TV to its fastest mode (e.g. 120 Hz); back after. */
+    private fun useHighRefresh(on: Boolean) {
+        if (on == highRefresh) return
+        highRefresh = on
+        val attributes = window.attributes
+        attributes.preferredDisplayModeId = if (on) {
+            sameResolutionModes().filter { it.refreshRate >= 100f }.maxByOrNull { it.refreshRate }?.modeId ?: 0
+        } else {
+            0 // let the system choose again
+        }
+        window.attributes = attributes
+    }
 
     private fun onPageFailed(description: String) {
         val url = connectedUrl ?: return
@@ -359,6 +402,7 @@ class MainActivity : Activity(), PcFinder.Listener, AirPlayReceiver.Ui, TvUpdate
         webView = null
         connectedUrl = null
         pcCasting = false
+        useHighRefresh(false)
         root.removeView(web)
         applyDualLayout()
         web.stopLoading()

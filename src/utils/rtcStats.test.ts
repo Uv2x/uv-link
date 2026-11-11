@@ -98,7 +98,7 @@ test('browserLabel names the engine and major version', () => {
 test('estimateGlassToGlassMs adds measured parts plus one frame, or returns null when a part is missing', () => {
   const sender = {
     bitrateMbps: 20, fps: 60, width: 1920, height: 1080, rttMs: 4, availableOutgoingMbps: 48,
-    packetLossPercent: 0, encodeMs: 3, encoder: 'NVIDIA', codec: 'H264', qualityLimitation: 'none'
+    packetLossPercent: 0, encodeMs: 3, encoder: 'NVIDIA', hardwareEncoder: true, codec: 'H264', qualityLimitation: 'none'
   };
   const tv = {
     fps: 60, width: 1920, height: 1080, bitrateMbps: 20, jitterBufferMs: 5, decodeMs: 2,

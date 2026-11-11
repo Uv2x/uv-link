@@ -19,6 +19,8 @@ export interface LiveReceiver {
   ip: string;
   status: ReceiverStatus;
   connectedAt: number;
+  /** Highest frame rate the TV can show (60 unless the TV app reports a 120 Hz display). */
+  maxFps: number;
 }
 
 export type PacketDirection = 'TV → Server' | 'Sender → TV' | 'TV → Sender' | 'Server';
@@ -30,6 +32,27 @@ export interface PacketLogItem {
   type: string;
   summary: string;
   payloadSize: number;
+}
+
+/** A screen or window the PC app can cast (GET /api/capture/sources, PC app only). */
+export interface CaptureSource {
+  /** desktopCapturer id, e.g. "screen:1:0" or "window:132456:0". */
+  id: string;
+  kind: 'screen' | 'window';
+  name: string;
+  /** PNG data URL, about 320x180. */
+  thumbnail: string;
+  /** Screens only: size in pixels and whether it's a virtual (driver-made) screen. */
+  width?: number;
+  height?: number;
+  virtual?: boolean;
+}
+
+/** What the PC app should capture on the next getDisplayMedia call (POST /api/capture/choice). */
+export interface CaptureChoice {
+  id: string;
+  /** 'system': everything you hear; 'app': only the chosen window's program; 'none': no sound. */
+  audio: 'system' | 'app' | 'none';
 }
 
 /** Decode-side measurements the TV reports back to the sender once per second. */
@@ -62,7 +85,7 @@ export interface TvStatsReport {
 /** Messages a browser sends to the server. `to` is a TV id (from senders) or a sender client id (from TVs). */
 export type ClientMessage =
   | { type: 'hello'; role: 'sender' }
-  | { type: 'hello'; role: 'tv'; tvId: string; name: string; device: string }
+  | { type: 'hello'; role: 'tv'; tvId: string; name: string; device: string; maxFps?: number }
   | { type: 'tv:rename'; name: string }
   | { type: 'webrtc:offer'; to: string; sdp: string }
   | { type: 'webrtc:answer'; to: string; sdp: string }

@@ -42,6 +42,12 @@ SOFTWARE.
 That FairPlay code is a Java port of **PlayFair** by EstebanKubata
 (https://github.com/EstebanKubata/playfair, GNU GPL), which RPiPlay and UxPlay also use.
 
+**Apple Lossless (ALAC) decoder**, Copyright (c) 2011 Apple Inc., https://github.com/macosforge/alac
+(Apache License 2.0, http://www.apache.org/licenses/LICENSE-2.0)
+
+- `app/src/main/java/com/uvlink/tv/airplay/AlacDecoder.kt` is a Kotlin port of the decoding parts of
+  the reference code (ALACDecoder.cpp, ag_dec.c, dp_dec.c, matrix_dec.c).
+
 ## Protocol references
 
 The rest of the AirPlay receiver (`app/src/main/java/com/uvlink/tv/airplay/*.kt`) was written for

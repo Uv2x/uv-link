@@ -210,12 +210,32 @@ internal class AudioPlayer {
     private val lock = Any()
     private var codec: MediaCodec? = null
     private var track: AudioTrack? = null
+    /** Speaker mode: Apple Lossless decoder and its output buffer, or plain PCM. */
+    private var alac: AlacDecoder? = null
+    private var pcm: ShortArray? = null
+    private var rawPcm = false
+    private var badFrames = 0
     private val info = MediaCodec.BufferInfo()
     @Volatile
     private var gain = 1f
 
     fun start(compressionType: Int, samplesPerFrame: Int) = synchronized(lock) {
         stopLocked()
+        when (compressionType) {
+            // Speaker mode (Music app etc.): Apple Lossless, or plain PCM. Decoded here, not by MediaCodec.
+            2 -> {
+                val frameLength = if (samplesPerFrame in 1..8192) samplesPerFrame else 352
+                alac = AlacDecoder(frameLength = frameLength)
+                pcm = ShortArray(frameLength * 2)
+                AirPlayLog.i("Playing Apple Lossless audio ($frameLength samples per frame)")
+                return@synchronized
+            }
+            1 -> {
+                rawPcm = true
+                AirPlayLog.i("Playing PCM audio")
+                return@synchronized
+            }
+        }
         val format = when (compressionType) {
             8 -> MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectELD)
@@ -244,6 +264,11 @@ internal class AudioPlayer {
     }
 
     fun frame(data: ByteArray) = synchronized(lock) {
+        val alacDecoder = alac
+        if (alacDecoder != null || rawPcm) {
+            playPcm(data, alacDecoder)
+            return@synchronized
+        }
         val decoder = codec ?: return@synchronized
         try {
             val index = decoder.dequeueInputBuffer(10_000)
@@ -332,7 +357,34 @@ internal class AudioPlayer {
         }
     }
 
+    /** ALAC (decoded here) or big-endian 16-bit PCM, both 44.1 kHz stereo, straight to the AudioTrack. */
+    private fun playPcm(data: ByteArray, decoder: AlacDecoder?) {
+        val samples: ShortArray
+        val count: Int
+        try {
+            if (decoder != null) {
+                val out = pcm ?: return
+                count = decoder.decode(data, out) * 2
+                samples = out
+            } else {
+                count = data.size / 2
+                samples = ShortArray(count) { i ->
+                    (((data[i * 2].toInt() and 0xff) shl 8) or (data[i * 2 + 1].toInt() and 0xff)).toShort()
+                }
+            }
+        } catch (e: Exception) {
+            if (++badFrames == 1 || badFrames % 500 == 0) AirPlayLog.i("Skipped an audio frame that didn't decode ($e)")
+            return
+        }
+        val player = track ?: createTrack(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_RAW, 44100, 2)) ?: return
+        player.write(samples, 0, count, AudioTrack.WRITE_NON_BLOCKING)
+    }
+
     private fun stopLocked() {
+        alac = null
+        pcm = null
+        rawPcm = false
+        badFrames = 0
         codec?.let {
             runCatching { it.stop() }
             runCatching { it.release() }

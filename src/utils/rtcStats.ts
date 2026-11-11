@@ -23,6 +23,8 @@ export interface SenderStatsSample {
   packetLossPercent: number | null;
   encodeMs: number | null;
   encoder: string | null;
+  /** True when the browser reports a power-efficient (hardware) encoder, e.g. NVENC. */
+  hardwareEncoder: boolean | null;
   codec: string | null;
   /** Why the encoder is holding back: 'none' | 'bandwidth' | 'cpu' | 'other'. */
   qualityLimitation: string | null;
@@ -105,6 +107,7 @@ export function createSenderStatsSampler(): (report: StatsReportLike) => SenderS
       packetLossPercent: fractionLost === null ? null : round(fractionLost * 100),
       encodeMs,
       encoder: str(outbound?.encoderImplementation),
+      hardwareEncoder: typeof outbound?.powerEfficientEncoder === 'boolean' ? outbound.powerEfficientEncoder : null,
       codec: codecName(byId, outbound?.codecId),
       qualityLimitation: str(outbound?.qualityLimitationReason)
     };

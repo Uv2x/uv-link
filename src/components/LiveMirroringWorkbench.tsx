@@ -12,7 +12,10 @@ import {
   Check,
   Radio
 } from 'lucide-react';
-import type { LatencyBudgetBreakdown, ZeroLatencyParameters } from '../utils/webrtcConfig';
+import { QUALITY_PRESETS, effectiveFps, type CastSettings } from '../utils/castSettings';
+import { openAppAudioTrack, type AppAudioTrack } from '../utils/appAudio';
+import { CapturePicker } from './CapturePicker';
+import type { CaptureChoice, CaptureSource } from '../shared/protocol';
 import type { LiveReceiver, TvStatsReport } from '../shared/protocol';
 import type { SignalingClient } from '../utils/signalingClient';
 import { createSenderStatsSampler, estimateGlassToGlassMs, type SenderStatsSample } from '../utils/rtcStats';
@@ -63,6 +66,8 @@ interface CastSession {
   audioCtx: AudioContext | null;
   /** The video codec offered first (the one the TV is expected to use). */
   codec: VideoCodecName;
+  /** Highest frame rate the TV can show. */
+  tvMaxFps: number;
   /** Capture size, e.g. 3440x1440 for an ultrawide screen. */
   sourceWidth: number;
   sourceHeight: number;
@@ -80,6 +85,7 @@ interface CastSession {
 interface PeerTarget {
   receiverId: string;
   receiverName: string;
+  tvMaxFps: number;
   stream: MediaStream;
   audioCtx: AudioContext | null;
   codec: VideoCodecName;
@@ -118,7 +124,30 @@ function writeCodecFailures(tvName: string, failures: string[]): void {
 const codecLabel = (codec: string): string =>
   ({ H264: 'H.264', H265: 'H.265', VP8: 'VP8', VP9: 'VP9', AV1: 'AV1' })[codec.toUpperCase()] ?? codec;
 
-const preferredCodec = (p: ZeroLatencyParameters): VideoCodecName => (p.codec === 'HEVC_Main10' ? 'H265' : 'H264');
+const preferredCodec = (p: CastSettings): VideoCodecName => p.codec;
+
+/**
+ * The capture's real frame size. getSettings() can report the main monitor's size when another
+ * screen is captured (seen in Electron with two monitors), so read it from an actual frame.
+ */
+async function frameSize(track: MediaStreamTrack): Promise<{ width: number; height: number }> {
+  const reported = track.getSettings();
+  const video = document.createElement('video');
+  video.muted = true;
+  video.srcObject = new MediaStream([track]);
+  try {
+    await video.play().catch(() => {});
+    for (let i = 0; i < 30 && !video.videoWidth; i++) await new Promise((r) => setTimeout(r, 50));
+    if (video.videoWidth > 0 && video.videoHeight > 0) return { width: video.videoWidth, height: video.videoHeight };
+  } finally {
+    video.srcObject = null;
+  }
+  return { width: reported.width ?? 1920, height: reported.height ?? 1080 };
+}
+
+/** "MediaFoundationVideoEncodeAccelerator (NVIDIA H.264 Encoder MFT)" -> "NVIDIA H.264 Encoder MFT". */
+const encoderName = (encoder: string | null): string =>
+  encoder ? (/\(([^)]+)\)\s*$/.exec(encoder)?.[1] ?? encoder) : 'name hidden by browser';
 
 function createAudioMeter(ctx: AudioContext, track: MediaStreamTrack): AudioMeter {
   const source = ctx.createMediaStreamSource(new MediaStream([track]));
@@ -148,9 +177,8 @@ const show = (value: number | string | null | undefined, unit = ''): string =>
   value === null || value === undefined ? '—' : `${value}${unit}`;
 
 interface LiveMirroringWorkbenchProps {
-  params: ZeroLatencyParameters;
-  budget: LatencyBudgetBreakdown;
-  onUpdateParams: (updater: (prev: ZeroLatencyParameters) => ZeroLatencyParameters) => void;
+  params: CastSettings;
+  onUpdateParams: (updater: (prev: CastSettings) => CastSettings) => void;
   receivers: LiveReceiver[];
   selectedReceiverId: string;
   onSelectReceiver: (id: string) => void;
@@ -165,7 +193,6 @@ interface LiveMirroringWorkbenchProps {
 
 export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   params,
-  budget,
   onUpdateParams,
   receivers,
   selectedReceiverId,
@@ -202,11 +229,15 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
   const [sizeNote, setSizeNote] = useState('');
 
   const paramsRef = useRef(params);
-  const budgetRef = useRef(budget);
   useEffect(() => {
     paramsRef.current = params;
-    budgetRef.current = budget;
-  }, [params, budget]);
+  }, [params]);
+  /** What the encoder is set to right now (shown in the header). */
+  const [sending, setSending] = useState<{ width: number; height: number; fps: number } | null>(null);
+  /** The PC app's screen/window picker, open while non-null. */
+  const [pickerSources, setPickerSources] = useState<CaptureSource[] | null>(null);
+  /** "This app only" sound for the running cast. */
+  const appAudioRef = useRef<AppAudioTrack | null>(null);
 
   useEffect(() => {
     signalingRef.current = signaling;
@@ -218,12 +249,12 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
    */
   const encodingFor = useCallback((session: CastSession) => {
     const p = paramsRef.current;
-    const abr = budgetRef.current.abrDecision;
-    const scale = Math.max(abr.scaleResolutionDownBy, session.fit * session.extraScale);
+    const cap = QUALITY_PRESETS[p.quality];
+    const scale = session.fit * session.extraScale * cap.scaleResolutionDownBy;
     return {
       scale,
-      fps: Math.min(p.targetFps, session.fpsCap),
-      maxBitrate: abr.targetBitrateKbps * 1000,
+      fps: Math.min(effectiveFps(p, session.tvMaxFps), session.fpsCap),
+      maxBitrate: cap.maxBitrateKbps * 1000,
       width: Math.round(session.sourceWidth / scale),
       height: Math.round(session.sourceHeight / scale)
     };
@@ -247,6 +278,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       } catch (err) {
         console.warn('Uv Link: could not update encoder settings', err);
       }
+      if (sessionRef.current === session) setSending({ width: encoding.width, height: encoding.height, fps: encoding.fps });
       return encoding;
     },
     [encodingFor]
@@ -262,8 +294,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     isStreaming,
     params.degradationPreference,
     params.targetFps,
-    budget.abrDecision.targetBitrateKbps,
-    budget.abrDecision.scaleResolutionDownBy
+    params.quality
   ]);
 
   // Test pattern: a running clock (photograph PC + TV together to measure real
@@ -360,6 +391,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       track.stop();
     });
     session.audioCtx?.close().catch(() => {});
+    appAudioRef.current?.close();
+    appAudioRef.current = null;
     if (notifyTv) signalingRef.current?.send({ type: 'webrtc:stop', to: session.receiverId });
   }, [closePeer]);
 
@@ -411,7 +444,39 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     });
   }, [signaling, endCast]);
 
-  const startCasting = async (source: CastSource) => {
+  /** In the PC app, show its screen/window picker first; in a browser, its own picker appears. */
+  const castScreen = async () => {
+    setError('');
+    try {
+      const res = await fetch('/api/capture/sources');
+      if (res.ok) {
+        const data = (await res.json()) as { sources?: CaptureSource[] };
+        if (data.sources?.length) {
+          setPickerSources(data.sources);
+          return;
+        }
+      }
+    } catch {
+      // Not the PC app: use the browser's picker.
+    }
+    void startCasting('screen');
+  };
+
+  const castPicked = async (choice: CaptureChoice) => {
+    setPickerSources(null);
+    try {
+      await fetch('/api/capture/choice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(choice)
+      });
+    } catch {
+      // The PC app falls back to its own screen dialog.
+    }
+    void startCasting('screen', choice);
+  };
+
+  const startCasting = async (source: CastSource, choice?: CaptureChoice) => {
     setError('');
     const signalingClient = signalingRef.current;
     const target = receivers.find((r) => r.id === selectedReceiverId);
@@ -426,6 +491,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     if (sessionRef.current) endCast(true);
 
     const p = paramsRef.current;
+    const castFps = effectiveFps(p, target.maxFps);
     setPhase('capturing');
 
     let stream: MediaStream;
@@ -440,11 +506,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
         return;
       }
       try {
+        // The PC app's picker decides the sound; elsewhere the Audio On/Muted setting does.
+        const systemSound = choice ? choice.audio === 'system' : p.audio.enabled;
         stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: { ideal: p.targetFps, max: p.targetFps } },
-          audio: p.audio.enabled
-            ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-            : false
+          video: { frameRate: { ideal: castFps, max: castFps } },
+          audio: systemSound ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false
         });
       } catch (err) {
         setPhase('idle');
@@ -458,7 +524,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
         setPhase('idle');
         return;
       }
-      stream = canvas.captureStream(p.targetFps);
+      stream = canvas.captureStream(castFps);
       if (p.audio.enabled) {
         // Quiet 440 Hz tone so you can confirm sound reaches the TV.
         audioCtx = new AudioContext({ sampleRate: 48000 });
@@ -484,6 +550,15 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       return;
     }
     videoTrack.contentHint = 'motion';
+    if (choice?.audio === 'app') {
+      // Only the chosen window's program: its sound comes from the PC app's helper.
+      try {
+        appAudioRef.current = await openAppAudioTrack();
+        stream.addTrack(appAudioRef.current.track);
+      } catch (err) {
+        setError(`Casting without sound: couldn't capture that app's sound (${err instanceof Error ? err.message : String(err)}).`);
+      }
+    }
     const [audioTrack] = stream.getAudioTracks();
     if (audioTrack) {
       audioCtx = audioCtx ?? new AudioContext();
@@ -512,7 +587,15 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     setActiveSource(source);
     setCastReceiverId(target.id);
     setIsStreaming(true);
-    await connectPeer({ receiverId: target.id, receiverName: target.name, stream, audioCtx, codec, failures });
+    await connectPeer({
+      receiverId: target.id,
+      receiverName: target.name,
+      tvMaxFps: target.maxFps,
+      stream,
+      audioCtx,
+      codec,
+      failures
+    });
   };
 
   /**
@@ -533,7 +616,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     const pc = new RTCPeerConnection({ iceServers: [] });
     const videoTransceiver = pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [stream] });
     preferVideoCodec(videoTransceiver, target.codec, target.failures);
-    if (audioTrack && p.audio.enabled) {
+    // The capture only has sound when sound was asked for (settings, or the PC app's picker).
+    if (audioTrack) {
       // Same stream id = the TV lip-syncs audio and video, which holds video back to match
       // the audio buffer (~40-60 ms). A separate stream lets video play as soon as it's decoded.
       const audioStream = p.audio.lipSyncLock ? stream : new MediaStream([audioTrack]);
@@ -541,9 +625,11 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     }
 
     // Never send more pixels than the TV shows; an ultrawide 3440x1440 becomes 1920x804.
-    const settings = videoTrack.getSettings();
-    const sourceWidth = settings.width ?? 1920;
-    const sourceHeight = settings.height ?? 1080;
+    const { width: sourceWidth, height: sourceHeight } = await frameSize(videoTrack);
+    if (videoTrack.readyState === 'ended') {
+      pc.close(); // the cast was stopped meanwhile
+      return;
+    }
     const fit = fitScale(sourceWidth, sourceHeight);
     const session: CastSession = {
       pc,
@@ -558,11 +644,12 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
       sourceWidth,
       sourceHeight,
       fit,
+      tvMaxFps: target.tvMaxFps,
       extraScale: target.load?.extraScale ?? 1,
-      fpsCap: target.load?.fpsCap ?? p.targetFps,
+      fpsCap: target.load?.fpsCap ?? effectiveFps(p, target.tvMaxFps),
       decodeLoad:
         target.load?.decodeLoad ??
-        createDecodeLoadController({ targetFps: p.targetFps, fittedWidth: Math.round(sourceWidth / fit) }),
+        createDecodeLoadController({ targetFps: effectiveFps(p, target.tvMaxFps), fittedWidth: Math.round(sourceWidth / fit) }),
       lastTvStats: null
     };
     sessionRef.current = session;
@@ -690,6 +777,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     void connectPeer({
       receiverId: session.receiverId,
       receiverName: session.receiverName,
+      tvMaxFps: session.tvMaxFps,
       stream: session.stream,
       audioCtx: session.audioCtx,
       codec: next,
@@ -707,6 +795,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
     void connectPeer({
       receiverId: session.receiverId,
       receiverName: session.receiverName,
+      tvMaxFps: session.tvMaxFps,
       stream: session.stream,
       audioCtx: session.audioCtx,
       codec: session.codec,
@@ -745,6 +834,14 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
 
   return (
     <section aria-label="Uv Link Sender and TV Receiver" className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+      {pickerSources && (
+        <CapturePicker
+          sources={pickerSources}
+          audioEnabled={params.audio.enabled}
+          onPick={(choice) => void castPicked(choice)}
+          onCancel={() => setPickerSources(null)}
+        />
+      )}
       {/* Left: sender controls */}
       <div className="lg:col-span-5 border border-slate-800/90 bg-slate-900/50 rounded-lg p-6 flex flex-col justify-between">
         <div>
@@ -760,7 +857,8 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
               </p>
             </div>
             <span className="text-xs font-mono text-slate-400 tabular-nums whitespace-nowrap">
-              {params.targetFps} fps · {codecLabel(activeCodec ?? preferredCodec(params))}
+              {sending ? `${sending.fps} fps` : `${effectiveFps(params, selectedReceiver?.maxFps)} fps`} ·{' '}
+              {codecLabel(activeCodec ?? preferredCodec(params))}
             </span>
           </div>
 
@@ -928,7 +1026,7 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
             <>
               <button
                 type="button"
-                onClick={() => void startCasting('screen')}
+                onClick={() => void castScreen()}
                 className="flex-1 px-4 py-2.5 text-xs font-semibold bg-sky-400 hover:bg-sky-300 text-slate-950 rounded-md flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
               >
                 <MonitorUp className="w-3.5 h-3.5" />
@@ -1050,10 +1148,10 @@ export const LiveMirroringWorkbench: React.FC<LiveMirroringWorkbenchProps> = ({
             <span className="text-slate-400 block">Encoder</span>
             <span className="font-mono text-slate-200 font-medium block mt-0.5 truncate" title={senderStats?.encoder ?? ''}>
               {senderStats
-                ? `${show(senderStats.codec)} · ${senderStats.encoder ?? 'name hidden by browser'}`
-                : params.forceHardwareEncoder
-                  ? 'Hardware preferred'
-                  : 'Software'}
+                ? `${show(senderStats.codec)} · ${encoderName(senderStats.encoder)}${
+                    senderStats.hardwareEncoder === true ? ' · hardware' : senderStats.hardwareEncoder === false ? ' · software' : ''
+                  }`
+                : '—'}
             </span>
           </div>
           <div>

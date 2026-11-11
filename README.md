@@ -19,12 +19,25 @@ lets TVs find the PC and sets up the connection; nothing leaves your home networ
    (the PC app shows the exact address), install, then open **Uv Link** on the TV.
    It finds the PC by itself.
    **Any other TV, phone or laptop:** open `http://<your-PC-IP>:3000/?mode=tv` in its browser.
-3. **PC:** pick the TV and press **Cast Screen to TV**.
+3. **PC:** pick the TV and press **Cast Screen to TV**. The PC app shows every screen and window:
+   cast a whole screen or a single window, with all PC sound, **only that app's sound**, or none.
 
 Tips:
 - *Lip Sync* keeps sound and picture together (best for videos). *Low Delay* gives the lowest
   picture delay (games, desktop). Turn on your TV's Game Mode for the lowest delay overall.
 - PC and TV must be on the same network. Guest Wi-Fi and router "AP isolation" block the connection.
+- **Settings** (video format, 30/60/120 fps, quality cap) are remembered. The picture is sized to the
+  TV (at most 1920x1080) and shrinks by itself if the TV can't decode fast enough; if a format freezes
+  on a TV, Uv Link switches to another one and remembers that for the TV.
+- H.264 is encoded on the graphics card when it can (NVIDIA, AMD and Intel through Windows).
+- 120 fps needs a 120 Hz TV running the Uv Link TV app; the TV switches to 120 Hz while casting.
+
+### Use the TV as a second screen
+
+Install the free, open-source [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/latest),
+add a 1920x1080 display in it, and choose *Extend these displays* in Windows display settings. The new
+screen appears in Uv Link's picker marked *second screen for the TV*: cast it and drag windows onto
+the TV like a real monitor. A second physical monitor works the same way.
 
 ### iPhone and iPad (AirPlay)
 
@@ -35,10 +48,12 @@ PC needed and nothing to install on the iPhone:
 2. On the iPhone or iPad (same Wi-Fi): **Control Center → Screen Mirroring →** that name.
 3. Press **Back** on the TV remote, or *Stop Mirroring* on the phone, to end it.
 
-The screen and its sound are mirrored (H.264 video, AAC-ELD audio). Not supported yet: playing to the
-TV as an AirPlay *speaker* only (e.g. from the Music app's AirPlay button), and AirPlay while the
-app is closed. The bottom line of the TV's start screen shows the latest AirPlay event, and
-`http://<TV-IP>:7000/uvlink/log` lists recent ones, for troubleshooting.
+The screen and its sound are mirrored (H.264 video, AAC-ELD audio). The TV also works as an AirPlay
+**speaker**: pick it from the AirPlay button in Music and other audio apps (Apple Lossless). While the
+PC is casting too, the iPhone appears next to it; ◀ ▶ on the remote switch between side by side,
+picture in picture and iPhone full screen. AirPlay only works while the app is open. The bottom line
+of the TV's start screen shows the latest AirPlay event, and `http://<TV-IP>:7000/uvlink/log` lists
+recent ones, for troubleshooting.
 
 ## Develop
 

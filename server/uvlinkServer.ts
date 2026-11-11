@@ -18,7 +18,9 @@ import type {
   PacketDirection,
   PacketLogItem,
   ServerMessage,
-  TvStatsReport
+  TvStatsReport,
+  CaptureChoice,
+  CaptureSource
 } from '../src/shared/protocol';
 import type { UpdateStatus } from '../src/shared/updates';
 import type { PcUpdater } from './pcUpdater';
@@ -44,6 +46,13 @@ export interface UvLinkServerOptions {
   printBanner?: boolean;
   /** The installed PC app's updater (see pcUpdater.ts); absent for the dev server. */
   updater?: PcUpdater;
+  /** PC app only: lists screens and windows, and takes the one to capture next (electron-main.cjs). */
+  capture?: {
+    sources: () => Promise<CaptureSource[]>;
+    choose: (choice: CaptureChoice) => void;
+    /** Starts capturing the chosen window's program sound (48 kHz stereo s16le), or null if unavailable. */
+    openAppAudio?: () => { stream: NodeJS.ReadableStream; stop: () => void } | null;
+  };
   /** Version reported by /api/update when there is no updater. */
   appVersion?: string;
 }
@@ -172,7 +181,8 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     advertise = true,
     printBanner = true,
     updater,
-    appVersion = '0.0.0'
+    appVersion = '0.0.0',
+    capture
   } = options;
 
   /** Set once listening; used in URLs and download scripts. */
@@ -184,6 +194,7 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
 
   const httpServer = createServer(app);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+  const appAudioWss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
 
   const clients = new Map<string, ClientConn>();
   const receivers = new Map<string, ReceiverRecord>();
@@ -349,6 +360,40 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     setTimeout(() => updater!.installNow(), 300);
   });
 
+  // ---------------------------------------------------------------- Capture picker (PC app)
+
+  // Screen and window thumbnails are private: only the PC app's own window may see or choose them.
+  app.get('/api/capture/sources', async (req, res) => {
+    if (!capture) {
+      res.status(404).json({ error: 'Only the Uv Link PC app lists screens and windows.' });
+      return;
+    }
+    if (!isLocalRequest(req)) {
+      res.status(403).json({ error: 'Only the Uv Link PC app can do this.' });
+      return;
+    }
+    try {
+      res.json({ sources: await capture.sources() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/capture/choice', (req, res) => {
+    if (!capture || !isLocalRequest(req) || !req.is('application/json')) {
+      res.status(403).json({ error: 'Only the Uv Link PC app can do this.' });
+      return;
+    }
+    const id = typeof req.body?.id === 'string' ? req.body.id.slice(0, 120) : '';
+    const audio = req.body?.audio === 'app' || req.body?.audio === 'none' ? req.body.audio : 'system';
+    if (!/^(screen|window):[\w:-]+$/.test(id)) {
+      res.status(400).json({ error: 'Unknown source.' });
+      return;
+    }
+    capture.choose({ id, audio });
+    res.json({ ok: true });
+  });
+
   // ---------------------------------------------------------------- Signaling
 
   httpServer.on('upgrade', (request, socket, head) => {
@@ -356,6 +401,22 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     if (pathname === '/ws/signaling') {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
+      });
+    } else if (pathname === '/ws/app-audio') {
+      // One program's sound for "this app only", as raw PCM. PC app window only.
+      const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? '');
+      const audio = local && capture?.openAppAudio ? capture.openAppAudio() : null;
+      if (!audio) {
+        socket.destroy();
+        return;
+      }
+      appAudioWss.handleUpgrade(request, socket, head, (ws) => {
+        audio.stream.on('data', (chunk: Buffer) => {
+          if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 1_000_000) ws.send(chunk);
+        });
+        audio.stream.on('end', () => ws.close());
+        ws.on('close', () => audio.stop());
+        ws.on('error', () => audio.stop());
       });
     } else if (!dev) {
       // In dev, Vite owns other upgrade paths (hot reload); in production nothing else is served.
@@ -368,6 +429,8 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
     const id = requestedId && /^[a-z0-9-]+$/i.test(requestedId) ? requestedId : newId('tv');
     const name = cleanText(msg.name, 60) ?? 'Uv Link TV';
     const device = cleanText(msg.device, 40) ?? 'Browser';
+    // Highest refresh rate the TV can show (the TV app reports its display modes); 60 if unknown.
+    const maxFps = typeof msg.maxFps === 'number' && msg.maxFps >= 24 && msg.maxFps <= 240 ? Math.round(msg.maxFps) : 60;
     client.role = 'tv';
     client.receiverId = id;
 
@@ -379,12 +442,12 @@ export async function startUvLinkServer(options: UvLinkServerOptions): Promise<R
       const previous = existing.clientId ? clients.get(existing.clientId) : undefined;
       existing.clientId = client.id;
       if (previous && previous !== client) previous.ws.terminate();
-      existing.info = { ...existing.info, name, device, ip: client.ip };
+      existing.info = { ...existing.info, name, device, ip: client.ip, maxFps };
       sendTo(client, welcome(client));
       log('TV → Server', 'TV RECONNECTED', `${name} is back from ${client.ip}`);
     } else {
       receivers.set(id, {
-        info: { id, name, device, ip: client.ip, status: 'idle', connectedAt: Date.now() },
+        info: { id, name, device, ip: client.ip, status: 'idle', connectedAt: Date.now(), maxFps },
         clientId: client.id,
         activeSenderId: null,
         removalTimer: null,

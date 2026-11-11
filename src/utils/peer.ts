@@ -51,8 +51,21 @@ export function codecTryOrder(preferred: VideoCodecName, failed: readonly string
 const MEDIA_CODECS = new Set(['h264', 'h265', 'vp8', 'vp9', 'av1']);
 
 /**
- * Puts `codec` first in the transceiver's preference list (H.264: constrained baseline with
- * packetization-mode=1 first, which TV hardware decoders handle best) and removes the codecs in
+ * Order of H.264 profiles to offer: Main, then Baseline, then Constrained Baseline. Chromium on
+ * Windows hardware-encodes Main and Baseline (NVIDIA / AMD / Intel via Media Foundation) but
+ * only software-encodes Constrained Baseline (OpenH264), and every TV decoder handles Main.
+ */
+export function h264ProfileRank(sdpFmtpLine: string | undefined): number {
+  const profile = /profile-level-id=([0-9a-f]{6})/i.exec(sdpFmtpLine ?? '')?.[1]?.toLowerCase() ?? '';
+  if (profile.startsWith('4d')) return 3;
+  if (profile.startsWith('4200')) return 2;
+  if (profile.startsWith('42e0')) return 1;
+  return 0;
+}
+
+/**
+ * Puts `codec` first in the transceiver's preference list (H.264: profiles Windows can encode in
+ * hardware first, see [h264ProfileRank], packetization-mode=1 only) and removes the codecs in
  * `exclude`, so the TV can't pick them. Returns false when the browser can't do this.
  */
 export function preferVideoCodec(
@@ -66,7 +79,7 @@ export function preferVideoCodec(
   const score = (c: RTCRtpCodec): number => {
     if (c.mimeType.toLowerCase() !== mime) return 0;
     const fmtp = c.sdpFmtpLine ?? '';
-    if (codec === 'H264') return 1 + (fmtp.includes('packetization-mode=1') ? 2 : 0) + (fmtp.includes('42e01f') ? 1 : 0);
+    if (codec === 'H264') return 1 + (fmtp.includes('packetization-mode=1') ? 4 : 0) + h264ProfileRank(fmtp);
     if (codec === 'VP9') return 1 + (fmtp.includes('profile-id=0') || !fmtp ? 1 : 0);
     return 1;
   };

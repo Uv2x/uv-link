@@ -3,44 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import {
-  ZeroLatencyParameters,
-  calculateLatencyBudget
-} from './utils/webrtcConfig';
+import React, { useState, useEffect, useCallback } from 'react';
 import type { LiveReceiver, PacketLogItem } from './shared/protocol';
 import { SignalingClient } from './utils/signalingClient';
+import { loadSettings, saveSettings, type CastSettings } from './utils/castSettings';
 import { DeviceInstallCards } from './components/DeviceInstallCards';
 import { NetworkQualityBanner } from './components/NetworkQualityBanner';
 import { LiveMirroringWorkbench, type LiveStreamStats } from './components/LiveMirroringWorkbench';
-import { StepBlueprintExplorer } from './components/StepBlueprintExplorer';
+import { CastSettingsPanel } from './components/CastSettingsPanel';
+import { ConnectionLog } from './components/ConnectionLog';
 import { TvReceiverScreen } from './components/TvReceiverScreen';
-
-const INITIAL_PARAMS: ZeroLatencyParameters = {
-  codec: 'H264_42e01f',
-  targetFps: 60,
-  baseResolution: '1920x1080',
-  degradationPreference: 'maintain-framerate',
-  zeroPlayoutDelay: true,
-  disableBFrames: true,
-  forceHardwareEncoder: true,
-  minBitrateKbps: 15000,
-  maxBitrateKbps: 35000,
-  startBitrateKbps: 25000,
-  packetLossPercent: 0,
-  estimatedBandwidthMbps: 42,
-  networkMode: 'Wi-Fi 6 (5GHz/6GHz 160MHz)',
-  audio: {
-    enabled: true,
-    codec: 'Opus_48kHz_Stereo',
-    sampleRateHz: 48000,
-    channels: 2,
-    bitrateKbps: 256,
-    ptimeMs: 10,
-    hardwareAudioTrackLowLatency: true,
-    lipSyncLock: true
-  }
-};
 
 const isTvModeUrl = () =>
   typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'tv';
@@ -53,8 +25,7 @@ function setTvModeInUrl(enabled: boolean) {
 }
 
 export default function App() {
-  const [params, setParams] = useState<ZeroLatencyParameters>(INITIAL_PARAMS);
-  const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4 | 5>(1);
+  const [settings, setSettings] = useState<CastSettings>(loadSettings);
   const [receivers, setReceivers] = useState<LiveReceiver[]>([]);
   const [selectedReceiverId, setSelectedReceiverId] = useState<string>('');
   const [packetLogs, setPacketLogs] = useState<PacketLogItem[]>([]);
@@ -65,9 +36,7 @@ export default function App() {
   const [signalingConnected, setSignalingConnected] = useState(false);
   const [isTvReceiverMode, setIsTvReceiverMode] = useState<boolean>(isTvModeUrl);
 
-  const blueprintSectionRef = useRef<HTMLDivElement | null>(null);
-
-  const budget = useMemo(() => calculateLatencyBudget(params), [params]);
+  useEffect(() => saveSettings(settings), [settings]);
 
   // Sender-side signaling: live TV list, packet log, and the channel the workbench casts over.
   useEffect(() => {
@@ -129,11 +98,6 @@ export default function App() {
     setIsTvReceiverMode(false);
   }, []);
 
-  const navigateToStep = (step: 1 | 2 | 3 | 4 | 5) => {
-    setActiveStep(step);
-    blueprintSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-
   const tvUrl = lanUrls[0] ? `${lanUrls[0]}/?mode=tv` : null;
 
   // Fullscreen receiver: open /?mode=tv in any TV / phone / laptop browser on the same network.
@@ -153,55 +117,24 @@ export default function App() {
           Uv Link
         </a>
 
-        {/* Zone 2: 5 concise single-line text navigation links */}
         <nav aria-label="Primary Navigation" className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-400">
-          <button
-            type="button"
-            onClick={() => navigateToStep(1)}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Architecture
-          </button>
-          <button
-            type="button"
-            onClick={() => navigateToStep(2)}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Zero-Latency ABR
-          </button>
-          <button
-            type="button"
-            onClick={() => navigateToStep(3)}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Signaling Log
-          </button>
-          <button
-            type="button"
-            onClick={() => navigateToStep(4)}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Android TV App
-          </button>
-          <button
-            type="button"
-            onClick={() => navigateToStep(5)}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Sender Code
-          </button>
+          <a href="#cast" className="hover:text-white transition-colors whitespace-nowrap">
+            Cast
+          </a>
+          <a href="#settings" className="hover:text-white transition-colors whitespace-nowrap">
+            Settings
+          </a>
+          <a href="#log" className="hover:text-white transition-colors whitespace-nowrap">
+            Connection log
+          </a>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center shrink-0">
-          <button
-            type="button"
-            onClick={() => setParams(INITIAL_PARAMS)}
-            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 rounded-md hover:bg-sky-300 transition-colors whitespace-nowrap shrink-0"
-          >
-            Reset Defaults
-          </button>
-        </div>
+        <a
+          href="#cast"
+          className="px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 rounded-md hover:bg-sky-300 transition-colors whitespace-nowrap shrink-0"
+        >
+          Cast to a TV
+        </a>
       </header>
 
       {/* Main Content Container */}
@@ -209,7 +142,7 @@ export default function App() {
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold text-white tracking-tight text-balance">
-              Uv Link — 60fps Screen &amp; Audio Mirroring
+              Uv Link — Cast your screen and sound to a TV
             </h1>
             <p className="text-sm text-slate-400 mt-1">
               Cast this PC&apos;s screen and sound to any TV, phone or laptop browser on your Wi-Fi. Peer-to-peer, nothing leaves your network.
@@ -226,18 +159,12 @@ export default function App() {
 
         <DeviceInstallCards onEnterTvMode={enterTvMode} tvUrl={tvUrl} receiverCount={receivers.length} />
 
-        <NetworkQualityBanner
-          params={params}
-          budget={budget}
-          onUpdateParams={setParams}
-          liveStats={liveStats}
-          isStreaming={isStreaming}
-        />
+        <NetworkQualityBanner settings={settings} liveStats={liveStats} isStreaming={isStreaming} />
 
+        <div id="cast" className="scroll-mt-24" />
         <LiveMirroringWorkbench
-          params={params}
-          budget={budget}
-          onUpdateParams={setParams}
+          params={settings}
+          onUpdateParams={setSettings}
           receivers={receivers}
           selectedReceiverId={selectedReceiverId}
           onSelectReceiver={setSelectedReceiverId}
@@ -250,21 +177,18 @@ export default function App() {
           setIsStreaming={setIsStreaming}
         />
 
-        <div ref={blueprintSectionRef}>
-          <StepBlueprintExplorer
-            activeStep={activeStep}
-            onSelectStep={setActiveStep}
-            params={params}
-            budget={budget}
-            onUpdateParams={setParams}
-            packetLogs={packetLogs}
-          />
-        </div>
+        <CastSettingsPanel
+          settings={settings}
+          onChange={setSettings}
+          tvMaxFps={receivers.find((r) => r.id === selectedReceiverId)?.maxFps ?? null}
+        />
+
+        <ConnectionLog entries={packetLogs} />
       </main>
 
       <footer className="border-t border-slate-900 px-8 py-5 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-4 max-w-[1320px] w-full mx-auto">
-        <span>Uv Link Local WebRTC Streaming</span>
-        <span>WebRTC · H.264 hardware encode/decode where the browser supports it</span>
+        <span>Uv Link · peer-to-peer on your network</span>
+        <span>Video and sound go straight from this PC to the TV (WebRTC)</span>
       </footer>
     </div>
   );

@@ -2,7 +2,7 @@
   "name": "uv-link",
   "productName": "Uv Link",
   "private": true,
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Cast your PC screen and sound to any TV on your Wi-Fi.",
   "author": "Uv Link",
   "repository": {
@@ -17,9 +17,10 @@
     "build:server": "esbuild server/uvlinkServer.ts --bundle --platform=node --format=cjs --target=node22 --external:vite --external:bufferutil --external:utf-8-validate --outfile=dist-server/uvlinkServer.cjs --log-level=warning",
     "build:icons": "electron scripts/render-icons.cjs",
     "build:tv": "node scripts/build-tv-apk.mjs",
-    "build:pc": "npm run build && npm run build:server && electron-builder --win --x64",
+    "build:app-audio": "node scripts/build-app-audio.mjs",
+    "build:pc": "npm run build && npm run build:server && npm run build:app-audio && electron-builder --win --x64",
     "release": "npm run build:tv && npm run build:pc",
-    "electron": "npm run build && npm run build:server && electron .",
+    "electron": "npm run build && npm run build:server && npm run build:app-audio && electron .",
     "start": "node server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
@@ -27,15 +28,12 @@
     "test": "tsx --test \"src/**/*.test.ts\" \"server/**/*.test.ts\""
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^6.1.1",
     "bonjour-service": "^1.4.4",
-    "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^8.3.0",
@@ -73,11 +71,27 @@
       {
         "from": "release",
         "to": "downloads",
-        "filter": ["UvLink-TV.apk"]
+        "filter": [
+          "UvLink-TV.apk"
+        ]
+      },
+      {
+        "from": "build/native",
+        "to": "native",
+        "filter": [
+          "UvLinkAppAudio.exe"
+        ]
       }
     ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "build/icon.png"
     },
     "nsis": {

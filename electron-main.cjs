@@ -8,12 +8,15 @@
  * Build:  npm run build:pc      -> release/UvLink-PC-Setup.exe
  * Try it: npm run electron      (no installer)
  */
-const { app, BrowserWindow, desktopCapturer, dialog, session, shell, Menu } = require('electron');
+const { app, BrowserWindow, desktopCapturer, dialog, session, shell, Menu, screen } = require('electron');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const PREFERRED_PORT = 3000;
 const INSTALLER_NAME = 'UvLink-PC-Setup.exe';
+/** Display names of virtual (driver-made) screens: a second screen just for the TV. */
+const VIRTUAL_SCREEN = /virtual|vdd|mtt|idd|parsec|spacedesk|usbmmidd|dummy/i;
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -21,6 +24,63 @@ if (!app.requestSingleInstanceLock()) {
   let mainWindow = null;
   let server = null;
   let updater = null;
+  /** What the page picked in its screen/window picker, used by the next getDisplayMedia. */
+  let pendingChoice = null;
+  /** Window handle whose program's sound to capture ("this app only"), or null. */
+  let appAudioWindow = null;
+
+  /** Screens and windows with thumbnails, for the page's picker. */
+  async function listCaptureSources() {
+    const displays = screen.getAllDisplays();
+    const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
+    const screens = [];
+    const windows = [];
+    for (const source of sources) {
+      const thumbnail = source.thumbnail.isEmpty() ? '' : source.thumbnail.toDataURL();
+      if (source.id.startsWith('screen:')) {
+        const display = displays.find((d) => String(d.id) === source.display_id);
+        const label = (display && display.label) || '';
+        screens.push({
+          id: source.id,
+          kind: 'screen',
+          name: label || source.name,
+          thumbnail,
+          width: display ? Math.round(display.size.width * display.scaleFactor) : undefined,
+          height: display ? Math.round(display.size.height * display.scaleFactor) : undefined,
+          virtual: VIRTUAL_SCREEN.test(label)
+        });
+      } else if (source.name && !source.name.startsWith('Uv Link')) {
+        windows.push({ id: source.id, kind: 'window', name: source.name, thumbnail });
+      }
+    }
+    return [...screens, ...windows];
+  }
+
+  /** The bundled helper that captures one program's sound (build/native in development). */
+  function appAudioHelperPath() {
+    const file = app.isPackaged
+      ? path.join(process.resourcesPath, 'native', 'UvLinkAppAudio.exe')
+      : path.join(app.getAppPath(), 'build', 'native', 'UvLinkAppAudio.exe');
+    return fs.existsSync(file) ? file : null;
+  }
+
+  /** Starts capturing the chosen window's program sound; the server streams it to the page. */
+  function openAppAudio() {
+    const helper = appAudioHelperPath();
+    const hwnd = appAudioWindow;
+    if (!helper || !hwnd) return null;
+    const child = spawn(helper, ['--hwnd', hwnd], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    child.on('error', (err) => console.error('Uv Link: app audio helper failed to start', err));
+    child.stderr.on('data', (d) => console.error(`Uv Link app audio: ${String(d).trim()}`));
+    return {
+      stream: child.stdout,
+      stop: () => {
+        // Closing its input tells the helper to stop; make sure it does.
+        child.stdin.end();
+        setTimeout(() => child.kill(), 1500).unref();
+      }
+    };
+  }
 
   app.on('second-instance', () => {
     if (!mainWindow) return;
@@ -87,7 +147,14 @@ if (!app.requestSingleInstanceLock()) {
           : path.join(appRoot, 'release'),
         printBanner: !app.isPackaged,
         updater: updater || undefined,
-        appVersion: app.getVersion()
+        appVersion: app.getVersion(),
+        capture: {
+          sources: listCaptureSources,
+          choose: (choice) => {
+            pendingChoice = { ...choice, at: Date.now() };
+          },
+          openAppAudio
+        }
       });
       if (updater) updater.start();
     } catch (err) {
@@ -98,6 +165,23 @@ if (!app.requestSingleInstanceLock()) {
 
     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
       try {
+        // The page's own picker chose a screen or window just before (see /api/capture/choice).
+        const choice = pendingChoice && Date.now() - pendingChoice.at < 30_000 ? pendingChoice : null;
+        pendingChoice = null;
+        appAudioWindow = null;
+        if (choice) {
+          const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] });
+          const source = sources.find((s) => s.id === choice.id);
+          if (!source) {
+            callback(null);
+            return;
+          }
+          // "This app only": the page streams the program's sound from the helper instead.
+          if (choice.audio === 'app' && source.id.startsWith('window:')) appAudioWindow = source.id.split(':')[1];
+          const systemSound = request.audioRequested && choice.audio === 'system';
+          callback(systemSound ? { video: source, audio: 'loopback' } : { video: source });
+          return;
+        }
         const sources = await desktopCapturer.getSources({ types: ['screen'] });
         const source = await pickScreen(sources);
         if (!source) {
